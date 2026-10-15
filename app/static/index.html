@@ -168,6 +168,7 @@
         <button id="focusBack" type="button" title="Back to all photos (Esc)">← All photos</button>
         <button id="focusPrev" type="button" title="Previous photo (←)">‹</button>
         <button id="focusNext" type="button" title="Next photo (→)">›</button>
+        <button id="focusSimilar" type="button" title="Sort all photos by how similar they are to this one">Find similar</button>
         <span id="focusName" class="meta"></span>
       </div>
       <section id="dropZone" class="drop-zone" tabindex="0" data-pane="photo">
@@ -205,7 +206,7 @@
       <div id="pendingExports" class="pending-exports" hidden></div>
       <div id="filterBar" class="filter-bar" hidden>
         <input id="batchSearch" type="search" spellcheck="false" autocomplete="off"
-          placeholder='Search… e.g. beach   category:portrait   people_count>2   exif.Model:"EOS R5"'>
+          placeholder='Search… e.g. like:"dog on a beach"   category:portrait   people_count>2   exif.Model:"EOS R5"'>
         <button id="batchSearchHelp" type="button" class="link" title="Search syntax">?</button>
         <select id="batchStatus" title="Show photos by run status">
           <option value="">All photos</option>
@@ -216,7 +217,11 @@
         <label>Sort <select id="batchSort"></select></label>
         <button id="batchSortDir" type="button" data-dir="asc">↑</button>
         <label>Group <select id="batchGroup"></select></label>
+        <label id="batchSimilarWrap" title="How alike photos must be to share a group: about 0.9 for near-duplicates, lower for looser groups" hidden>Alike
+          <input id="batchSimilar" type="range" min="0.6" max="0.98" step="0.005" aria-label="How alike">
+          <input id="batchSimilarValue" type="number" min="0" max="1" step="0.01" aria-label="How alike, 0 to 1"></label>
         <button id="batchExif" type="button" class="link" hidden></button>
+        <button id="batchEmbed" type="button" class="link" hidden></button>
       </div>
       <div id="searchHelp" class="note search-help" hidden>
         Words match anywhere in a photo's result, EXIF or file name. All terms must match.
@@ -224,6 +229,9 @@
         <code>has:field</code> has a value · <code>-term</code> excludes · <code>"quotes"</code> for spaces.
         Fields are result keys (<code>category</code> or the full <code>classification.category</code>), EXIF tags
         (<code>exif.Model</code>, <code>DateTimeOriginal&gt;2024</code>), <code>name</code> and <code>status</code>.
+        After <em>Find similar</em>, <code>similar&gt;0.85</code> keeps the photos closest to that one (1 is identical).
+        <code>like:"red car at night"</code> puts the photos that best match a description first, without hiding any:
+        it knows what can be seen, not names or dates, and works best in English.
         EXIF fields need <em>read EXIF</em> first; photos you open are read automatically.
       </div>
       <div id="batchEmpty" class="batch-empty" role="button" tabindex="0">
@@ -401,6 +409,7 @@
             <button type="button" class="link" data-vs-export="vtt" title="Download subtitles (WebVTT)" disabled>VTT</button>
             <button type="button" class="link" data-vs-export="txt" title="Download the text with a time on each line" disabled>TXT</button>
             <button type="button" class="link" data-vs-export="json" title="Download every line and word with its times (JSON)" disabled>JSON</button>
+            <button id="vsVideo" type="button" class="link" title="Download the video with these subtitles, as a track the player can turn on and off or burned into the picture" disabled>Video</button>
           </span>
         </div>
         <div class="v-speech-bar">
@@ -408,6 +417,8 @@
           <select id="vsLanguage" title="The language spoken; detected from the first speech when not set"></select>
           <select id="vsTrack" title="Which audio track to transcribe" hidden></select>
           <button id="vsRun" type="button" title="Transcribe the video's speech with timestamps" disabled>Transcribe</button>
+          <select id="vsSpeakers" title="How many people speak; Auto finds out"></select>
+          <button id="vsDiarize" type="button" title="Find who speaks when, so each line shows its speaker" disabled>Identify speakers</button>
           <input id="vsSearch" type="search" placeholder="Search" spellcheck="false" autocomplete="off" title="Show only lines with these words">
         </div>
         <div id="vsList" class="output v-speech"><span class="empty">Choose a video, then press Transcribe.</span></div>
@@ -440,9 +451,26 @@
     </form>
   </dialog>
 
+  <dialog id="vsVideoDialog" class="dialog">
+    <form id="vsVideoForm" method="dialog">
+      <h2>Video with subtitles</h2>
+      <p id="vsVideoInfo" class="note"></p>
+      <label class="check"><input type="radio" name="vsVideoMode" value="track" checked> <span><strong>Subtitle track</strong> · the original, unchanged, with the subtitles as a track players can turn on and off (MKV). Starts at once.</span></label>
+      <label class="check"><input type="radio" name="vsVideoMode" value="360"> <span><strong>Burned in, 360p</strong> · drawn onto the picture of the preview copy, so they show in any player (MP4). <span id="vsVideo360" class="meta"></span></span></label>
+      <label class="check"><input type="radio" name="vsVideoMode" value="full"> <span><strong>Burned in, original size</strong> · re-encodes the whole video on the server's CPU (MP4). <span id="vsVideoFull" class="meta"></span></span></label>
+      <div id="vsVideoDone" class="v-subtitled"></div>
+      <p id="vsVideoError" class="dialog-error"></p>
+      <div class="dialog-actions">
+        <button id="vsVideoCancel" type="button">Close</button>
+        <button id="vsVideoGo" type="submit" class="primary">Download</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="/static/app.js"></script>
   <script src="/static/workflows.js"></script>
   <script src="/static/batch-view.js"></script>
+  <script src="/static/batch-similar.js"></script>
   <script src="/static/batch.js"></script>
   <script src="/static/video.js"></script>
   <script src="/static/video-tag.js"></script>

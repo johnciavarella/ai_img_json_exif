@@ -1,0 +1,5 @@
+# The CPU builds installed by the Containerfile. Without these, pip would replace torch with a
+# newer (CUDA) build to satisfy the newest speechbrain, which pyannote.audio pulls in.
+torch==2.5.1
+torchaudio==2.5.1
+torchvision==0.20.1

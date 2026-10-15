@@ -1,4 +1,5 @@
-"""Video scene service: probes uploads, builds a low-res proxy, runs scene detectors, transcribes speech.
+"""Video scene service: probes uploads, builds a low-res proxy, runs scene detectors, transcribes speech
+and tells its speakers apart.
 
 The web app writes uploads into VIDEO_DIR (a volume shared with this service); everything
 derived from them lives next to the source in the same folder:
@@ -14,9 +15,12 @@ derived from them lives next to the source in the same folder:
     <id>/tags/<key>/<config>/  a result's scenes tagged by one model or workflow: <n>.json is
                           scene n's JSON, <n>.record.json the whole run that made it
     <id>/transcripts/<key>.json  speech as timed segments and words, one per model + language
-    <id>/tmp/             scratch for a running job (16 kHz audio while transcribing)
+    <id>/speakers/a<track>.json  who speaks when on an audio track, shared by its transcripts
+    <id>/subtitled/<transcript key>-<360|full>.mp4  the video with a transcript burned in
+    <id>/tmp/             scratch for a running job (16 kHz audio while transcribing or
+                          diarizing, the subtitles being muxed or burned in)
 
-Heavy work (proxy, detection, transcription) runs one job at a time on a worker thread; the UI polls status.
+Heavy work (proxy, detection, transcription, diarization, burning in subtitles) runs one job at a time on a worker thread; the UI polls status.
 Tagging runs in the browser, scene by scene, like the image side's batch runs; this service only
 supplies each scene's frame and keeps what comes back.
 The video itself is never cut: results export as a scene list with thumbnails and tags.
@@ -44,10 +48,12 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 import numpy as np
 
+import diarize
 import transcribe as speech
 from detectors import DETECTORS, Cancelled, Context, curve_from_scores, min_frames
 
@@ -417,29 +423,45 @@ def transcript_summary(path: Path) -> Optional[dict]:
     return s
 
 
+def extract_audio(job: Job, root: Path, info: dict, track: int, weight: float) -> Path:
+    """Decode an audio track to 16 kHz mono s16le PCM in tmp/, for the first weight of the
+    progress bar. The caller deletes it."""
+    tmp = root / "tmp"
+    tmp.mkdir(exist_ok=True)
+    pcm = tmp / f"audio-{job.id}.pcm"
+    # The proxy carries the first audio track and is far smaller than the source, which
+    # ffmpeg would have to read end to end; other tracks come from the source
+    proxy = root / "proxy.mp4"
+    src, stream = ((proxy, "0:a:0") if track == 0 and proxy.exists()
+                   else (source_path(root), f"0:{info['audio'][track]['index']}"))
+    job.stage = "Extracting the audio"
+    decoding = SimpleNamespace(report=lambda f: job.report(weight * f))
+    try:
+        run_ffmpeg(["-i", str(src), "-map", stream, "-vn", "-ac", "1", "-ar", str(speech.SAMPLE_RATE),
+                    "-f", "s16le", str(pcm)], decoding, info["duration"])
+    except BaseException:
+        pcm.unlink(missing_ok=True)
+        raise
+    return pcm
+
+
+def audio_info(root: Path) -> dict:
+    info = read_json(root / "info.json")
+    if not info:
+        raise RuntimeError("The video isn't ready yet.")
+    if not info["audio"]:
+        raise RuntimeError("This video has no audio track.")
+    return info
+
+
 def run_transcribe(params: dict):
     def run(job: Job) -> None:
         root = VIDEO_DIR / job.video_id
-        info = read_json(root / "info.json")
-        if not info:
-            raise RuntimeError("The video isn't ready yet.")
-        if not info["audio"]:
-            raise RuntimeError("This video has no audio track.")
+        info = audio_info(root)
         started = time.time()
-        tmp = root / "tmp"
-        tmp.mkdir(exist_ok=True)
-        pcm = tmp / f"audio-{job.id}.pcm"
+        weight = 0.03  # share of the progress bar for decoding
+        pcm = extract_audio(job, root, info, params["track"], weight)
         try:
-            # The proxy carries the first audio track and is far smaller than the source, which
-            # ffmpeg would have to read end to end; other tracks come from the source
-            proxy = root / "proxy.mp4"
-            src, stream = ((proxy, "0:a:0") if params["track"] == 0 and proxy.exists()
-                           else (source_path(root), f"0:{info['audio'][params['track']]['index']}"))
-            weight = 0.03  # share of the progress bar for decoding
-            job.stage = "Extracting the audio"
-            decoding = SimpleNamespace(report=lambda f: job.report(weight * f))
-            run_ffmpeg(["-i", str(src), "-map", stream, "-vn", "-ac", "1", "-ar", str(speech.SAMPLE_RATE),
-                        "-f", "s16le", str(pcm)], decoding, info["duration"])
             out = speech.transcribe(
                 pcm, params, lambda f: job.report(weight + (1 - weight) * f),
                 lambda text: setattr(job, "stage", text), THREADS)
@@ -455,6 +477,168 @@ def run_transcribe(params: dict):
         })
 
     return run
+
+
+def transcript_keys(root: Path, track: Optional[int] = None) -> list:
+    """Keys of the video's transcripts, or of those of one audio track."""
+    out = []
+    for p in (root / "transcripts").glob("*.json"):
+        s = transcript_summary(p)
+        if s and (track is None or (s.get("params") or {}).get("track", 0) == track):
+            out.append(p.stem)
+    return out
+
+
+# ---------- speakers ----------
+
+def speakers_path(root: Path, track: int) -> Path:
+    return root / "speakers" / f"a{track}.json"
+
+
+def speakers_summary(path: Path) -> Optional[dict]:
+    """What status needs: the settings, the count and each speaker's stretches for the timeline."""
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    cached = _summaries.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    data = read_json(path)
+    if not data:
+        return None
+    s = {k: data.get(k) for k in ("params", "count", "created", "elapsed", "label")}
+    s["track"] = data["params"]["track"]
+    s["bands"] = diarize.bands(data["turns"])
+    _summaries[path] = (mtime, s)
+    return s
+
+
+def run_diarize(params: dict):
+    def run(job: Job) -> None:
+        root = VIDEO_DIR / job.video_id
+        info = audio_info(root)
+        started = time.time()
+        weight = 0.03
+        pcm = extract_audio(job, root, info, params["track"], weight)
+        try:
+            out = diarize.diarize(pcm, params, lambda f: job.report(weight + (1 - weight) * f),
+                                  lambda text: setattr(job, "stage", text))
+        finally:
+            pcm.unlink(missing_ok=True)
+        path = speakers_path(root, params["track"])
+        path.parent.mkdir(exist_ok=True)
+        write_json(path, {
+            "engine": "pyannote.audio", "model": "speaker-diarization-3.1", "label": diarize.LABEL,
+            "params": params, "created": time.time(), "elapsed": round(time.time() - started, 1),
+            "duration": info["duration"], "count": out["count"], "turns": out["turns"],
+        })
+        # Videos burned in with the old speakers (or none) are out of date
+        drop_subtitled(root, transcript_keys(root, params["track"]))
+
+    return run
+
+
+def with_speakers(root: Path, data: dict) -> dict:
+    """A transcript with its track's speakers, if diarized: lines split where the speaker
+    changes and each carrying "speaker"."""
+    found = read_json(speakers_path(root, (data.get("params") or {}).get("track", 0)))
+    if not found:
+        return data
+    return {**data, "segments": diarize.assign(data["segments"], found["turns"]),
+            "speakers": found["count"], "speakers_created": found["created"]}
+
+
+# ---------- video with subtitles ----------
+# Muxed as a subtitle track (stream copy, streamed as it's made) or burned into the picture (a
+# job that re-encodes, saved under subtitled/)
+
+BURN_SIZES = ("360", "full")
+
+
+def subtitled_path(root: Path, key: str, size: str) -> Path:
+    return root / "subtitled" / f"{key}-{size}.mp4"
+
+
+def subtitled_list(root: Path) -> list:
+    out = []
+    for p in sorted((root / "subtitled").glob("*.mp4")):
+        if p.name.endswith(".part.mp4"):
+            continue
+        key, _, size = p.stem.rpartition("-")
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append({"name": p.stem, "key": key, "size": size, "bytes": st.st_size, "created": st.st_mtime})
+    return out
+
+
+def drop_subtitled(root: Path, keys: list) -> None:
+    for key in keys:
+        for size in BURN_SIZES:
+            subtitled_path(root, key, size).unlink(missing_ok=True)
+
+
+def write_srt(root: Path, data: dict) -> Path:
+    tmp = root / "tmp"
+    tmp.mkdir(exist_ok=True)
+    path = tmp / f"subs-{uuid.uuid4().hex}.srt"
+    path.write_text(speech.to_srt(data["segments"]), encoding="utf-8")
+    return path
+
+
+def run_burn(key: str, size: str):
+    def run(job: Job) -> None:
+        root = VIDEO_DIR / job.video_id
+        info = audio_info(root)
+        data = with_speakers(root, transcript_result(root, key))
+        track = (data.get("params") or {}).get("track", 0)
+        srt = write_srt(root, data)
+        out = subtitled_path(root, key, size)
+        out.parent.mkdir(exist_ok=True)
+        part = out.with_name(out.stem + ".part.mp4")
+        # libass sizes SRT text against a 288-line canvas, so the same style suits both sizes;
+        # fontconfig falls back to Noto CJK for what DejaVu doesn't cover
+        style = "FontName=DejaVu Sans,FontSize=16,Outline=1.2,Shadow=0.6,MarginV=14"
+        burn = f"subtitles=filename={srt}:force_style='{style}',format=yuv420p"
+        if size == "360":
+            # The proxy, with its own audio (the first track) or the transcript's track from the source
+            inputs = ["-i", str(root / "proxy.mp4")]
+            if track:
+                inputs += ["-i", str(source_path(root))]
+            maps = ["-map", "0:v:0", "-map", f"1:{info['audio'][track]['index']}" if track else "0:a:0?"]
+            codecs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                      *(["-c:a", "aac", "-b:a", "128k"] if track else ["-c:a", "copy"])]
+        else:
+            inputs = ["-i", str(source_path(root))]
+            maps = ["-map", f"0:{info['video']['index']}", "-map", f"0:{info['audio'][track]['index']}"]
+            codecs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "192k"]
+        try:
+            run_ffmpeg([*inputs, *maps, "-vf", burn, *codecs, "-movflags", "+faststart", "-f", "mp4", str(part)],
+                       job, info["duration"])
+            part.replace(out)
+        finally:
+            srt.unlink(missing_ok=True)
+            part.unlink(missing_ok=True)
+
+    return run
+
+
+async def mux_stream(proc: subprocess.Popen, first: bytes, cleanup):
+    """Yield ffmpeg's output as it comes; stop ffmpeg if the download stops part-way. Async, so
+    the download stopping cancels it and runs the finally: Starlette never closes a plain
+    generator, which would leave ffmpeg blocked on a full pipe."""
+    try:
+        yield first
+        while chunk := await run_in_threadpool(proc.stdout.read, 1 << 20):
+            yield chunk
+        await run_in_threadpool(proc.wait)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        cleanup()
 
 
 # ---------- tags ----------
@@ -702,6 +886,8 @@ def speech_models():
                     "downloaded": speech.downloaded(m)} for m in speech.MODELS.values()],
         "default": speech.DEFAULT_MODEL,
         "languages": speech.languages(),
+        "diarization": {"label": diarize.LABEL, "available": diarize.available(), "downloaded": diarize.downloaded(),
+                        "size_mb": diarize.SIZE_MB, "max_speakers": diarize.MAX_SPEAKERS, "note": diarize.note()},
     }
 
 
@@ -736,6 +922,10 @@ def status(video_id: str, root: Path, full: bool) -> dict:
         out["transcripts"] = sorted(
             filter(None, (transcript_summary(p) for p in (root / "transcripts").glob("*.json"))),
             key=lambda s: s.get("created") or 0)
+        out["speakers"] = sorted(
+            filter(None, (speakers_summary(p) for p in (root / "speakers").glob("a*.json"))),
+            key=lambda s: s["track"])
+        out["subtitled"] = subtitled_list(root)
     return out
 
 
@@ -925,20 +1115,160 @@ def transcript_result(root: Path, key: str) -> dict:
 
 @app.get("/videos/{video_id}/transcripts/{key}")
 def get_transcript(video_id: str, key: str):
-    return transcript_result(folder(video_id), key)
+    root = folder(video_id)
+    return with_speakers(root, transcript_result(root, key))
 
 
 @app.delete("/videos/{video_id}/transcripts/{key}")
 def delete_transcript(video_id: str, key: str):
-    transcript_path(folder(video_id), check_key(key)).unlink(missing_ok=True)
+    root = folder(video_id)
+    transcript_path(root, check_key(key)).unlink(missing_ok=True)
+    drop_subtitled(root, [key])
     return {"deleted": key}
+
+
+class DiarizeRequest(BaseModel):
+    track: int = 0  # which audio track, counting from 0
+    speakers: int = 0  # how many speakers there are; 0: find out
+
+
+@app.post("/videos/{video_id}/diarize")
+def start_diarize(video_id: str, req: DiarizeRequest):
+    root = folder(video_id)
+    info = read_json(root / "info.json")
+    if info and not info["audio"]:
+        raise HTTPException(400, "This video has no audio track.")
+    if not diarize.available():
+        raise HTTPException(400, diarize.note())
+    params = diarize.normalize(req.model_dump(), len((info or {}).get("audio") or [None]))
+    key = diarize.key(params)
+    done = read_json(speakers_path(root, params["track"]))
+    if done and done.get("params") == params:
+        return {"key": key, "cached": True}
+    if not source_path(root):
+        raise HTTPException(409, "The upload is not complete.")
+    if not (root / "proxy.mp4").exists():
+        prep = _latest(video_id, "prepare")
+        if not prep or prep.state not in ("queued", "running"):
+            submit(video_id, "prepare", "Preparing video", prepare)
+    job = submit(video_id, "diarize", "Speakers", run_diarize(params), key=key)
+    return {"key": key, "cached": False, "job": job.public()}
+
+
+@app.get("/videos/{video_id}/speakers/{track}")
+def get_speakers(video_id: str, track: int):
+    data = read_json(speakers_path(folder(video_id), track))
+    if data is None:
+        raise HTTPException(404, "No speakers for that track.")
+    return data
+
+
+@app.delete("/videos/{video_id}/speakers/{track}")
+def delete_speakers(video_id: str, track: int):
+    root = folder(video_id)
+    speakers_path(root, track).unlink(missing_ok=True)
+    drop_subtitled(root, transcript_keys(root, track))
+    return {"deleted": track}
+
+
+@app.get("/videos/{video_id}/transcripts/{key}/video")
+def subtitled_video(video_id: str, key: str):
+    """The original video with the transcript as a subtitle track: its video and audio streams
+    copied into Matroska, which takes any codec, streamed as ffmpeg writes it. Data streams
+    (cameras' timecode tracks) and the source's own subtitles, which Matroska may not take as
+    they are, are left out."""
+    root = folder(video_id)
+    data = with_speakers(root, transcript_result(root, key))
+    info = read_json(root / "info.json")
+    src = source_path(root)
+    if not info or not src:
+        raise HTTPException(409, "The video isn't ready yet.")
+    srt = write_srt(root, data)
+    lang = speech.iso639_2(data.get("language"))
+    title = data["label"] + (" with speakers" if data.get("speakers") else "")
+    err = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", str(src), "-i", str(srt),
+         "-map", f"0:{info['video']['index']}", "-map", "0:a?", "-map", "1:0", "-c", "copy", "-c:s", "srt",
+         "-metadata:s:s:0", f"language={lang}", "-metadata:s:s:0", f"title={title}",
+         "-disposition:s:0", "default", "-f", "matroska", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=err,
+    )
+
+    def cleanup():
+        srt.unlink(missing_ok=True)
+        err.close()
+
+    # The first bytes come quickly; if ffmpeg fails before them, say why instead of sending an empty file
+    first = proc.stdout.read(1 << 16)
+    if not first:
+        code = proc.wait()
+        err.seek(0)
+        message = err.read().decode(errors="replace").strip()[-500:]
+        cleanup()
+        raise HTTPException(500, f"ffmpeg exited {code}: {message}")
+    name = f"{_stem(root)}_{data['language'] or 'speech'}_subtitled.mkv"
+    return StreamingResponse(mux_stream(proc, first, cleanup), media_type="video/x-matroska",
+                             headers=_disposition(name))
+
+
+class BurnRequest(BaseModel):
+    size: str = "360"  # "360": the 360p preview copy, quick; "full": the original's size
+
+
+@app.post("/videos/{video_id}/transcripts/{key}/burn")
+def start_burn(video_id: str, key: str, req: BurnRequest):
+    root = folder(video_id)
+    transcript_result(root, key)
+    if req.size not in BURN_SIZES:
+        raise HTTPException(400, "Invalid size.")
+    if subtitled_path(root, key, req.size).exists():
+        return {"name": f"{key}-{req.size}", "cached": True}
+    info = read_json(root / "info.json")
+    proxy = root / "proxy.mp4"
+    if not info or not proxy.exists():
+        raise HTTPException(409, "The video isn't ready yet.")
+    # About as big as what it's re-encoded from, at these settings
+    need = info["size"] if req.size == "full" else proxy.stat().st_size * 2
+    free = shutil.disk_usage(VIDEO_DIR).free
+    if free < need + (1 << 30):
+        raise HTTPException(507, f"Not enough disk space: burning in subtitles needs about {need / 1e9:.1f} GB "
+                                 f"and the video volume has {free / 1e9:.1f} GB free.")
+    label = "Subtitles · " + ("360p" if req.size == "360" else "original size")
+    job = submit(video_id, "burn", label, run_burn(key, req.size), key=f"burn-{key}-{req.size}")
+    return {"name": f"{key}-{req.size}", "cached": False, "job": job.public()}
+
+
+def subtitled_file(root: Path, name: str) -> Path:
+    key, _, size = name.rpartition("-")
+    if not KEY_RE.match(name) or size not in BURN_SIZES:
+        raise HTTPException(400, "Invalid name.")
+    return subtitled_path(root, key, size)
+
+
+@app.get("/videos/{video_id}/subtitled/{name}")
+def get_subtitled(video_id: str, name: str):
+    root = folder(video_id)
+    path = subtitled_file(root, name)
+    if not path.exists():
+        raise HTTPException(404, "No such video.")
+    key, _, size = name.rpartition("-")
+    lang = (read_json(transcript_path(root, key)) or {}).get("language") or "speech"
+    filename = f"{_stem(root)}_{lang}_subtitled{'_360p' if size == '360' else ''}.mp4"
+    return FileResponse(path, media_type="video/mp4", headers=_disposition(filename))
+
+
+@app.delete("/videos/{video_id}/subtitled/{name}")
+def delete_subtitled(video_id: str, name: str):
+    subtitled_file(folder(video_id), name).unlink(missing_ok=True)
+    return {"deleted": name}
 
 
 @app.get("/videos/{video_id}/transcripts/{key}/export")
 def export_transcript(video_id: str, key: str, format: str = "srt"):
     """Subtitles (srt, vtt), plain text with a time per line (txt), or every segment and word (json)."""
     root = folder(video_id)
-    data = transcript_result(root, key)
+    data = with_speakers(root, transcript_result(root, key))
     name = f"{_stem(root)}_{data['language'] or 'speech'}"
     segments = data["segments"]
     if format == "srt":
@@ -957,7 +1287,8 @@ def export_transcript(video_id: str, key: str, format: str = "srt"):
             "exported": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "video": {"name": meta.get("name"), "duration": data["duration"]},
             "model": data["label"], "language": data["language"],
-            "language_probability": data["language_probability"], "segments": segments,
+            "language_probability": data["language_probability"],
+            **({"speakers": data["speakers"]} if data.get("speakers") else {}), "segments": segments,
         }
         return Response(json.dumps(doc, indent=2, ensure_ascii=False), media_type="application/json",
                         headers=_disposition(f"{name}.json"))
@@ -1029,7 +1360,7 @@ def export(video_id: str, key: str, format: str = "zip", config: str = "", trans
         raise HTTPException(409, "The video isn't ready yet.")
     result = scene_result(root / "scenes" / f"{key}.json")
     name = f"{_stem(root)}_{result['detector']}_scenes"
-    spoken = transcript_result(root, transcript) if transcript else None
+    spoken = with_speakers(root, transcript_result(root, transcript)) if transcript else None
     doc = export_doc(root, info, result, thumbnails=format == "zip", config=config, transcript=spoken)
     if format == "json":
         return Response(json.dumps(doc, indent=2, ensure_ascii=False), media_type="application/json",

@@ -254,13 +254,26 @@ async def classify_vision(client: httpx.AsyncClient, vision_url: str, model: str
     for key in ("labels", "label_template", "top_k", "threshold", "classes"):
         if params.get(key) not in (None, "", []):
             body[key] = params[key]
-    r = await client.post(f"{vision_url}/classify", json=body)
+    data = _vision_json(await client.post(f"{vision_url}/classify", json=body))
+    data["summary"] = _vision_summary(data)
+    return data
+
+
+async def embed_vision(client: httpx.AsyncClient, vision_url: str, image_data_url: Optional[str] = None, *,
+                       text: Optional[str] = None, model: str = "siglip2-base") -> dict:
+    """A unit-length vector for an image, or for a description (text), from the vision service:
+    {model, dim, vector, ...}. Both land in the same space, so either can be compared with photos.
+    Used by the CLI."""
+    body = {"model": model, **({"text": text} if text is not None else {"image_data_url": image_data_url})}
+    return _vision_json(await client.post(f"{vision_url}/embed", json=body))
+
+
+def _vision_json(r: httpx.Response) -> dict:
     data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"detail": r.text}
     if r.status_code >= 400:
         detail = data.get("detail") if isinstance(data.get("detail"), str) else ""
         # Keep the status on server errors so callers can tell an outage from a bad request
         raise RuntimeError(f"HTTP {r.status_code}: {detail}" if r.status_code >= 500 or not detail else detail)
-    data["summary"] = _vision_summary(data)
     return data
 
 

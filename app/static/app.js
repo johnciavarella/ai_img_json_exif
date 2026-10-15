@@ -225,13 +225,13 @@ function resetPreview() {
 }
 
 // Decode a file and scale it down for the models. Rejects if the browser can't display it.
-function prepareImage(file) {
+function prepareImage(file, maxEdge = MAX_IMAGE_EDGE) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
       URL.revokeObjectURL(url);
-      const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(img.width, img.height));
+      const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
       const w = Math.round(img.width * scale);
       const h = Math.round(img.height * scale);
       const canvas = document.createElement("canvas");

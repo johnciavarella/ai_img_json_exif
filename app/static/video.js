@@ -948,7 +948,8 @@ function renderTrackInfo() {
 }
 
 // One thin row per result, so detectors can be compared at a glance; click one to show it.
-// Transcripts add a row each showing where there is speech.
+// Transcripts add a row each showing where there is speech, and speakers one per audio track
+// with each speaker in a colour of their own.
 function renderCompare() {
   const s = vid.status;
   const dur = videoDuration();
@@ -980,9 +981,10 @@ function renderCompare() {
     if (job.kind === "prepare") continue;
     const canvas = h("canvas", {});
     const state = job.state === "queued" ? "queued" : job.stage || `running · ${Math.floor(job.progress * 100)}%`;
+    const named = speechJobLabel(job); // video-speech.js
     const row = h("div", { class: "v-track running" },
-      h("span", { class: "v-track-label" }, h("strong", {}, job.kind === "transcribe" ? "Speech" : job.label),
-        h("span", { class: "meta" }, job.kind === "transcribe" ? `${job.label.replace(/^Whisper /, "")} · ${state}` : state)),
+      h("span", { class: "v-track-label" }, h("strong", {}, named ? named.title : job.label),
+        h("span", { class: "meta" }, named?.meta ? `${named.meta} · ${state}` : state)),
       canvas, h("span"));
     rows.push({ row, canvas, progress: job.progress });
   }
@@ -1002,6 +1004,15 @@ function renderCompare() {
     }
     if (!dur) continue;
     ctx.fillStyle = r.active ? accent : muted;
+    if (r.bands) {
+      ctx.globalAlpha = r.active ? 0.85 : 0.6;
+      for (const [a, b, n] of r.bands) {
+        ctx.fillStyle = cssVar(`--spk-${((n - 1) % 8) + 1}`);
+        ctx.fillRect((a / dur) * w, 4, Math.max(((b - a) / dur) * w, 1), hgt - 8);
+      }
+      ctx.globalAlpha = 1;
+      continue;
+    }
     if (r.spans) {
       ctx.globalAlpha = r.active ? 0.6 : 0.45;
       for (const [a, b] of r.spans) ctx.fillRect((a / dur) * w, 4, Math.max(((b - a) / dur) * w, 1), hgt - 8);
@@ -1093,7 +1104,9 @@ function drawBusy() {
     const queued = s.jobs.length - 1;
     text = running.kind === "prepare" ? "Preparing a 360p copy for the detectors"
       : running.kind === "transcribe" ? `Transcribing · ${running.label}${running.stage ? ` · ${running.stage}` : ""}`
-        : `Detecting scenes · ${running.label}`;
+        : running.kind === "diarize" ? `Identifying speakers${running.stage ? ` · ${running.stage}` : ""}`
+          : running.kind === "burn" ? `Burning in subtitles · ${running.label.replace(/^Subtitles · /, "")}`
+            : `Detecting scenes · ${running.label}`;
     if (running.state === "queued") text += " (waiting for other videos)";
     if (queued > 0) text += ` · ${queued} more queued`;
     progress = running.progress;

@@ -7,6 +7,9 @@ const VIEW_UI_KEY = "llm-classifier-batch-view";
 const view = {
   json: new Map(),  // fp -> result JSON for the selected model/workflow
   exif: new Map(),  // fp -> flat EXIF tags; cached in IndexedDB and shared by every model/workflow
+  vectors: new Map(), // fp -> unit-length SigLIP 2 vector (batch-similar.js); cached in IndexedDB
+  similarTo: null,  // fp of the photo "Find similar" sorts against
+  like: null,       // {text, vector, neg} for a like:"..." search term, once its vector has arrived
   order: [],        // item indices in display order, each once (for prev/next in focused mode)
   filtered: false,  // true when the search or status filter hides some photos
   loadSeq: 0,
@@ -71,9 +74,15 @@ function entryOf(item) {
   }));
 }
 
-// "status" changes as runs finish, so it is read live rather than cached in the entry
+// "status" changes as runs finish, and "similar" with the photo Find similar was pressed on, so
+// they are read live rather than cached in the entry
 function fieldValues(item, field) {
-  return field === "status" ? [tileState(item)] : entryOf(item).fields.get(field);
+  if (field === "status") return [tileState(item)];
+  if (field === "similar" || field === "match") {
+    const s = field === "similar" ? similarity(item) : likeMatch(item);
+    return s === undefined ? undefined : [s];
+  }
+  return entryOf(item).fields.get(field);
 }
 
 function invalidateEntries() {
@@ -125,7 +134,13 @@ function entryMatches(entry, values, t) {
 // ---------- applying the view ----------
 function applyView() {
   if (view.fieldsStale) rebuildFieldOptions();
-  const terms = parseQuery(f.search.value);
+  // like:"..." sorts by how well photos match a description rather than filtering them
+  const parsed = parseQuery(f.search.value);
+  const like = parsed.find((t) => t.field === "like" && t.value);
+  const terms = parsed.filter((t) => t.field !== "like");
+  const likeVector = like && textVector(like.value);
+  view.like = likeVector ? { text: like.value, vector: likeVector, neg: like.neg } : null;
+  f.sort.disabled = f.dir.disabled = !!like;
   const status = f.status.value;
   let shown = batch.items.map((_, i) => i).filter((i) => {
     const item = batch.items[i];
@@ -135,8 +150,12 @@ function applyView() {
   view.filtered = shown.length < batch.items.length;
 
   const values = (i, field) => fieldValues(batch.items[i], field);
-  shown = sortIndices(shown, f.sort.value, f.dir.dataset.dir, values);
-  renderTiles(groupIndices(shown, f.group.value, values));
+  shown = view.like
+    ? sortIndices(shown, "match", view.like.neg ? "asc" : "desc", values)
+    : sortIndices(shown, f.sort.value, f.dir.dataset.dir, values);
+  renderTiles(f.group.value === "similar" ? similarGroups(shown) : groupIndices(shown, f.group.value, values));
+  updateSimilarUi();
+  updateFocusNav();
   saveViewUi();
   refreshTiles();
 }
@@ -186,7 +205,13 @@ function renderTiles(groups) {
   const nodes = [];
   const used = new Set();
   view.order = [];
-  batch.items.forEach((item) => (item.clones = []));
+  for (const item of batch.items) {
+    item.clones?.forEach((c) => {
+      thumbObserver.unobserve(c);
+      item.inView?.delete(c);
+    });
+    item.clones = [];
+  }
   for (const g of groups) {
     if (g.label !== null) {
       nodes.push(h("div", { class: "tile-group" }, h("strong", {}, g.label), h("span", { class: "meta" }, ` ${g.indices.length}`)));
@@ -201,6 +226,7 @@ function renderTiles(groups) {
         const clone = item.tile.cloneNode(true);
         clone.addEventListener("click", () => setFocus(i));
         item.clones.push(clone);
+        thumbObserver.observe(clone); // keeps the thumbnail while this copy is on screen
         nodes.push(clone);
       }
     }
@@ -215,17 +241,21 @@ async function loadViewData() {
   const items = batch.items;
   const key = configKey();
   const withResult = key ? items.filter((item) => batch.status.has(resultKey(item, key))) : [];
-  const [records, exif] = await Promise.all([
+  const [records, exif, vectors] = await Promise.all([
     resultStore.getMany(withResult.map((item) => resultKey(item, key))),
     resultStore.getExif(items.map((item) => item.fp)),
+    resultStore.getVectors(items.map((item) => item.fp)),
   ]);
   if (seq !== view.loadSeq || items !== batch.items) return;
   view.json = new Map(withResult.map((item, n) => [item.fp, recordResult(records[n])]));
   view.exif = exif;
+  // Vectors don't depend on the model, so a reload for another model keeps any added since
+  view.vectors = new Map([...vectors, ...[...view.vectors].filter(([fp]) => !vectors.has(fp))]);
   invalidateEntries();
   rebuildFieldOptions();
   updateExifButton();
   applyView();
+  similarLoaded();
 }
 
 // Called by batch.js when a run saves a new result
@@ -291,8 +321,8 @@ function rebuildFieldOptions() {
   const exifTags = new Set();
   for (const flat of view.exif.values()) Object.keys(flat).forEach((t) => exifTags.add(t));
   const fixed = [["name", "File name"], ["status", "Status"]];
-  fillFieldSelect(f.sort, "Folder order", fixed, jsonPaths, exifTags);
-  fillFieldSelect(f.group, "No grouping", fixed, jsonPaths, exifTags);
+  fillFieldSelect(f.sort, "Folder order", [...fixed, ["similar", "Similarity"]], jsonPaths, exifTags);
+  fillFieldSelect(f.group, "No grouping", [...fixed, ["similar", "Similar photos"]], jsonPaths, exifTags);
 }
 
 // A sort or group menu: none (first), fixed [value, text] fields, then result paths and EXIF tags
@@ -316,6 +346,7 @@ function saveViewUi() {
   try {
     localStorage.setItem(VIEW_UI_KEY, JSON.stringify({
       search: f.search.value, status: f.status.value, sort: f.sort.value, dir: f.dir.dataset.dir, group: f.group.value,
+      similar: similarThreshold(),
     }));
   } catch { /* storage unavailable */ }
 }

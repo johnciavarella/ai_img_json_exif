@@ -149,7 +149,8 @@ const TOUR_STEPS = [
     target: ".batch-grid", mode: "batch",
     title: "The grid",
     text: "Each border shows the state for the selected model or workflow: grey not run, green done, red failed. " +
-      "Results are saved in this browser, so picking the same folder again brings them back. Click a photo to see its result.",
+      "Results are saved in this browser, so picking the same folder again brings them back. Click a photo to see its result. " +
+      "<strong>Group › Similar photos</strong> puts look-alike photos together, and <strong>Find similar</strong> on an open photo sorts the rest by how close they are.",
   },
   {
     target: "#batchRerun", mode: "batch",
@@ -197,6 +198,8 @@ const TOUR_STEPS = [
     text: "<strong>Transcribe</strong> turns the speech into timed lines with Whisper, running on the server. " +
       "<em>small</em> is a good start; larger models are more accurate and slower, and each downloads on first use. " +
       "The line being spoken follows the video; click one to jump there. SRT and VTT are subtitles, TXT has a time on each line. " +
+      "<strong>Identify speakers</strong> finds who speaks when, so each line names its speaker. " +
+      "<strong>Video</strong> downloads the video with the subtitles as a track, or burned into the picture. " +
       "Each scene's words go into <strong>Export scenes</strong>, and into workflow prompts as <code>{{exif.Speech}}</code>.",
   },
   {
