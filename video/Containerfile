@@ -12,15 +12,21 @@ WORKDIR /srv
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
         torch==2.5.1 torchvision==0.20.1
 
-# ffmpeg builds the proxy, feeds the detectors and extracts audio for transcription
+# torchaudio for pyannote's speaker diarization: in a layer of its own so the one above stays
+# shared with vision/, and from the CPU index so pip can't pull a CUDA build
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torchaudio==2.5.1
+
+# ffmpeg builds the proxy, feeds the detectors, extracts audio for transcription and burns in
+# subtitles, with libass drawing them in DejaVu and, for Chinese, Japanese and Korean, Noto CJK.
+# torchaudio needs libgomp.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg \
+ && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-cjk libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt constraints.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
-COPY server.py detectors.py transnetv2.py transcribe.py ./
+COPY server.py detectors.py transnetv2.py transcribe.py diarize.py ./
 
 # /videos is shared with the web app, which writes the uploads (both run as uid 1001)
 RUN useradd --system --uid 1001 --create-home app \

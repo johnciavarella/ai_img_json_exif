@@ -79,6 +79,25 @@ def run_siglip(bundle, img: Image.Image, req: "ClassifyRequest", threshold: floa
     return {"predictions": preds, "threshold": threshold}
 
 
+def embed_siglip(bundle, img: Image.Image) -> torch.Tensor:
+    model, processor = bundle
+    inputs = processor(images=img, return_tensors="pt")
+    with torch.inference_mode():
+        vec = model.get_image_features(**inputs)[0]
+    # Unit length, so cosine similarity is a plain dot product
+    return torch.nn.functional.normalize(vec, dim=-1)
+
+
+def embed_siglip_text(bundle, text: str) -> torch.Tensor:
+    model, processor = bundle
+    # Lowercase, as SigLIP 2 was trained, and phrased like the zero-shot labels
+    inputs = processor(text=[DEFAULT_TEMPLATE.format(text.strip().lower())], padding="max_length",
+                       max_length=64, return_tensors="pt")
+    with torch.inference_mode():
+        vec = model.get_text_features(**inputs)[0]
+    return torch.nn.functional.normalize(vec, dim=-1)
+
+
 # The checkpoint uses PASCAL VOC names for a few COCO classes; report the usual COCO names,
 # which are also what workflows and saved results used with YOLO
 COCO_NAMES = {
@@ -166,6 +185,9 @@ SPECS = {
 }
 # Model ids that were replaced, so saved workflows and settings files keep working
 ALIASES = {"yolov8s": "rtdetr-v2-s"}
+# Models that can also turn an image, or a description, into a vector in the same space: for grouping
+# similar photos and finding photos that match a description
+EMBEDDERS = {"siglip2-base": {"image": embed_siglip, "text": embed_siglip_text}}
 
 
 # ---------- model cache ----------
@@ -227,7 +249,7 @@ def models():
             {
                 "id": s.id, "kind": s.kind, "source": s.source, "description": s.description,
                 "labels": s.labels, "default_threshold": s.default_threshold,
-                "loaded": s.id in _loaded,
+                "loaded": s.id in _loaded, "embed": s.id in EMBEDDERS,
             }
             for s in SPECS.values()
         ],
@@ -265,3 +287,33 @@ def classify(req: ClassifyRequest):
         "image_size": list(img.size),
         "timing_ms": {"load": round(load_ms, 1), "inference": round(infer_ms, 1)},
     }
+
+
+class EmbedRequest(BaseModel):
+    model: str = "siglip2-base"
+    image_data_url: Optional[str] = None
+    text: Optional[str] = None  # instead of an image: a description to match photos against
+
+
+@app.post("/embed")
+def embed(req: EmbedRequest):
+    model_id = ALIASES.get(req.model, req.model)
+    if model_id not in EMBEDDERS:
+        raise HTTPException(404, f"Model '{req.model}' has no embeddings. Available: {', '.join(EMBEDDERS)}")
+    if (req.image_data_url is None) == (req.text is None):
+        raise HTTPException(400, "Give either image_data_url or text.")
+    if req.text is not None and not req.text.strip():
+        raise HTTPException(400, "text is empty.")
+    kind, value = ("text", req.text) if req.text is not None else ("image", decode_image(req.image_data_url))
+
+    with _lock:
+        bundle, load_ms = get_model(SPECS[model_id])
+        t = time.perf_counter()
+        vec = EMBEDDERS[model_id][kind](bundle, value)
+        infer_ms = (time.perf_counter() - t) * 1000
+
+    out = {"model": model_id, "dim": vec.shape[0], "vector": [round(v, 6) for v in vec.tolist()]}
+    if kind == "image":
+        out["image_size"] = list(value.size)
+    out["timing_ms"] = {"load": round(load_ms, 1), "inference": round(infer_ms, 1)}
+    return out

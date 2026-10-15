@@ -1,9 +1,12 @@
 "use strict";
 // Transcript panel on the video side's Scenes view: runs Whisper on the open video's speech
-// (video/transcribe.py), lists the timed lines, follows the player and downloads subtitles.
+// (video/transcribe.py) and pyannote on who speaks when (video/diarize.py), lists the timed
+// lines with their speakers, follows the player, and downloads subtitles or the video with them.
 // video.js calls onSpeechStatus with each status, adds speechTracks to its comparison rows and
 // speechHoverText to the timeline's hover; the scene export (speechExportKey) and Tag scenes'
 // workflow prompts (speechForScenes) get each scene's words from the transcript shown here.
+// Speakers belong to an audio track, not a transcript: the server merges them into every
+// transcript of that track, so a transcript is reloaded when its track's speakers change.
 
 const SPEECH_PAGE = 300; // lines added at a time as the list scrolls
 const FOLLOW_PAUSE_MS = 4000; // after the list is scrolled by hand, it stops following the player
@@ -13,16 +16,29 @@ const se = {
   language: $("vsLanguage"),
   track: $("vsTrack"),
   run: $("vsRun"),
+  speakers: $("vsSpeakers"),
+  diarize: $("vsDiarize"),
   search: $("vsSearch"),
   list: $("vsList"),
   count: $("vsCount"),
   exports: document.querySelectorAll("[data-vs-export]"),
+  video: $("vsVideo"),
+  dialog: $("vsVideoDialog"),
+  form: $("vsVideoForm"),
+  videoInfo: $("vsVideoInfo"),
+  video360: $("vsVideo360"),
+  videoFull: $("vsVideoFull"),
+  videoDone: $("vsVideoDone"),
+  videoError: $("vsVideoError"),
+  videoGo: $("vsVideoGo"),
+  videoCancel: $("vsVideoCancel"),
 };
 
 const sp = {
   models: [],
+  diarization: null, // what /speech-models says about speaker diarization
   active: null, // key of the transcript shown
-  data: new Map(), // "<video>/<key>" -> transcript
+  data: new Map(), // "<video>/<key>/<when its track's speakers were found>" -> transcript
   lines: [], // indices of the shown transcript's segments that match the search
   rendered: 0,
   playing: -1, // segment index under the playhead
@@ -59,6 +75,12 @@ async function loadSpeechModels() {
   const langs = data.languages.map((c) => ({ value: c, text: languageNames(c) }))
     .sort((a, b) => a.text.localeCompare(b.text));
   fillSelect(se.language, [{ value: "", text: "Detect language" }, ...langs], saved.language || "");
+  sp.diarization = data.diarization || null;
+  const max = sp.diarization?.max_speakers || 10;
+  fillSelect(se.speakers, [
+    { value: "0", text: "Auto speakers" },
+    ...Array.from({ length: max }, (_, i) => ({ value: String(i + 1), text: `${i + 1} speaker${i ? "s" : ""}` })),
+  ], String(vid.ui.speakers || 0));
 }
 
 function speechParams() {
@@ -83,6 +105,11 @@ function onSpeechSettings() {
 }
 
 [se.model, se.language, se.track].forEach((el) => el.addEventListener("change", onSpeechSettings));
+se.speakers.addEventListener("change", () => {
+  vid.ui.speakers = Number(se.speakers.value) || 0;
+  saveVideoUi(); // video.js
+  updateSpeechButtons();
+});
 
 // One option per audio track, shown only when there is more than one
 function renderTracks(info) {
@@ -105,6 +132,11 @@ function renderTracks(info) {
 function onSpeechStatus(s, prev) {
   renderTracks(s.info);
   const same = prev?.id === s.id;
+  // Speakers found or deleted since the last poll: reload the transcript shown, which the
+  // server merges them into
+  const shown = sp.active && (s.transcripts || []).find((t) => t.key === sp.active);
+  const speakersChanged = same && shown
+    && speakersOf(s, shown.params.track)?.created !== speakersOf(prev, shown.params.track)?.created;
   const before = new Set((same ? prev.transcripts : []).map((t) => t.key));
   const added = (s.transcripts || []).filter((t) => !before.has(t.key));
   const selected = selectedTranscript();
@@ -112,21 +144,50 @@ function onSpeechStatus(s, prev) {
     const pick = selected || (same ? null : s.transcripts[s.transcripts.length - 1]);
     if (pick) selectTranscript(pick);
     else showNoTranscript();
-  } else if (selected && added.some((t) => t.key === selected.key)) {
-    showTranscript(selected.key);
+  } else if ((selected && added.some((t) => t.key === selected.key)) || speakersChanged) {
+    showTranscript((selected || shown).key);
   }
   if (same) {
     for (const t of added) {
       const lang = t.language ? ` (${languageNames(t.language)})` : "";
       vStatus(`${t.label}: ${t.count} line${t.count === 1 ? "" : "s"}, ${t.words} words${lang} in ${formatDuration(t.elapsed * 1000)}.`);
     }
+    const before = new Map((prev.speakers || []).map((x) => [x.track, x.created]));
+    for (const x of s.speakers || []) {
+      if (before.get(x.track) === x.created) continue;
+      vStatus(`Speakers: ${x.count} found${x.track ? ` on track ${x.track + 1}` : ""} in ${formatDuration(x.elapsed * 1000)}.`);
+    }
+    const had = new Set((prev.subtitled || []).map((x) => x.name));
+    for (const x of s.subtitled || []) {
+      if (!had.has(x.name)) vStatus(`Video with subtitles ready (${fmtBytes(x.bytes)}): press Video in the Transcript panel to download it.`);
+    }
   }
   updateSpeechButtons();
+  if (se.dialog.open) renderVideoDialog();
+}
+
+// The speakers found on an audio track, from a status
+function speakersOf(s, track) {
+  return (s?.speakers || []).find((x) => x.track === (track || 0)) || null;
+}
+
+function speakerColor(n) {
+  return `var(--spk-${((n - 1) % 8) + 1})`;
+}
+
+function speakerName(n) {
+  return `Speaker ${n}`;
 }
 
 function speechJob() {
   const key = selectedKeyGuess();
   return (vid.status?.jobs || []).find((j) => j.kind === "transcribe" && j.key === key);
+}
+
+// The diarize job for the audio track chosen in the panel (diarize.key in video/diarize.py)
+function speakersJob() {
+  const key = `speakers-a${speechParams().track}`;
+  return (vid.status?.jobs || []).find((j) => j.kind === "diarize" && j.key === key);
 }
 
 // The key the server gives these settings (speech.key in video/transcribe.py)
@@ -145,15 +206,35 @@ function updateSpeechButtons() {
     : selectedTranscript() ? "Already transcribed with these settings; shown below."
       : "Transcribe the video's speech with timestamps";
   se.exports.forEach((b) => { b.disabled = !activeTranscript(); });
+  se.video.disabled = !activeTranscript();
+
+  const d = sp.diarization;
+  const found = speakersOf(s, speechParams().track);
+  const djob = speakersJob();
+  const same = found && (found.params?.speakers || 0) === (Number(se.speakers.value) || 0);
+  se.diarize.disabled = !s || s.state === "uploading" || noAudio || !d?.available || !!djob || !!same;
+  se.diarize.textContent = djob ? (djob.state === "queued" ? "Queued…" : "Identifying…") : "Identify speakers";
+  se.diarize.title = !d ? "Speaker diarization is unavailable."
+    : !d.available ? d.note
+      : noAudio ? "This video has no audio track."
+        : same ? `Already done: ${found.count} speaker${found.count === 1 ? "" : "s"} on this track. Choose another number to run it again.`
+          : found ? `Run again with this number of speakers, replacing the ${found.count} found before`
+            : `Find who speaks when, so each line shows its speaker. ${d.note}`;
 }
 
 // ---------- transcripts ----------
+// The cache key of a transcript, which changes when its track's speakers do
+function transcriptCacheKey(key) {
+  const t = (vid.status?.transcripts || []).find((x) => x.key === key);
+  return `${vid.id}/${key}/${speakersOf(vid.status, t?.params?.track)?.created || ""}`;
+}
+
 function activeTranscript() {
-  return sp.active ? sp.data.get(`${vid.id}/${sp.active}`) : null;
+  return sp.active ? sp.data.get(transcriptCacheKey(sp.active)) : null;
 }
 
 async function loadTranscript(key) {
-  const cacheKey = `${vid.id}/${key}`;
+  const cacheKey = transcriptCacheKey(key);
   if (!sp.data.has(cacheKey)) {
     sp.data.set(cacheKey, await vFetch(`/api/video/${vid.id}/transcripts/${key}`));
     while (sp.data.size > 4) sp.data.delete(sp.data.keys().next().value); // a long one holds every word
@@ -225,9 +306,10 @@ function renderLines() {
     if (terms.every((w) => text.includes(w))) sp.lines.push(i);
   });
   const lang = t.language ? ` · ${languageNames(t.language)}` : "";
+  const speakers = t.speakers ? ` · ${t.speakers} speaker${t.speakers === 1 ? "" : "s"}` : "";
   se.count.textContent = terms.length
     ? `${sp.lines.length} of ${t.segments.length} lines`
-    : `${t.segments.length} lines · ${t.label.replace(/^Whisper /, "")}${lang}`;
+    : `${t.segments.length} lines · ${t.label.replace(/^Whisper /, "")}${lang}${speakers}`;
   sp.rendered = 0;
   sp.followed = -1;
   se.list.replaceChildren();
@@ -253,9 +335,15 @@ function appendLines(upto) {
   for (let n = sp.rendered; n < upto; n++) {
     const i = sp.lines[n];
     const seg = t.segments[i];
-    rows.push(h("div", { class: "v-line" + (i === sp.playing ? " playing" : ""), dataset: { i }, title: `${fmtTime(seg.start)} – ${fmtTime(seg.end)}` },
+    // The speaker is named where it changes from the line above
+    const above = n > 0 ? t.segments[sp.lines[n - 1]] : null;
+    const who = seg.speaker != null && seg.speaker !== above?.speaker
+      ? h("span", { class: "v-line-speaker", style: `--spk: ${speakerColor(seg.speaker)}` }, `S${seg.speaker}`)
+      : null;
+    const span = `${fmtTime(seg.start)} – ${fmtTime(seg.end)}`;
+    rows.push(h("div", { class: "v-line" + (i === sp.playing ? " playing" : ""), dataset: { i }, title: seg.speaker != null ? `${speakerName(seg.speaker)} · ${span}` : span },
       h("span", { class: "v-line-time" }, fmtTime(seg.start).replace(/\.\d+$/, "")),
-      h("span", { class: "v-line-text" }, highlight(seg.text, terms))));
+      h("span", { class: "v-line-text" }, who, highlight(seg.text, terms))));
   }
   se.list.append(...rows);
   sp.rendered = upto;
@@ -367,7 +455,7 @@ async function deleteTranscript(t) {
     vStatus(`Could not delete: ${e.message}`, "error");
     return;
   }
-  sp.data.delete(`${vid.id}/${t.key}`);
+  sp.data.delete(transcriptCacheKey(t.key));
   if (sp.active === t.key) showNoTranscript();
   await pollNow();
 }
@@ -375,6 +463,126 @@ async function deleteTranscript(t) {
 se.exports.forEach((b) => b.addEventListener("click", () => {
   if (sp.active) download(`/api/video/${vid.id}/transcripts/${sp.active}/export?format=${b.dataset.vsExport}`); // video.js
 }));
+
+// ---------- speakers ----------
+async function runDiarize() {
+  if (!vid.id || se.diarize.disabled) return;
+  const { track } = speechParams();
+  try {
+    const r = await vPost(`/api/video/${vid.id}/diarize`, { track, speakers: Number(se.speakers.value) || 0 });
+    if (!r.cached) {
+      const d = sp.diarization;
+      vStatus(`Speakers queued.${d && !d.downloaded ? ` The models download first (${d.size_mb} MB).` : ""}`);
+      if (d) d.downloaded = true; // only the first run downloads
+    }
+  } catch (e) {
+    vStatus(e.message, "error");
+  }
+  await pollNow(); // video.js
+}
+
+se.diarize.addEventListener("click", runDiarize);
+
+async function deleteSpeakers(x) {
+  try {
+    await vFetch(`/api/video/${vid.id}/speakers/${x.track}`, { method: "DELETE" });
+  } catch (e) {
+    vStatus(`Could not delete: ${e.message}`, "error");
+    return;
+  }
+  await pollNow();
+}
+
+// ---------- video with subtitles ----------
+function videoDialogMode() {
+  return se.form.querySelector("input[name=vsVideoMode]:checked")?.value || "track";
+}
+
+function subtitledOf(key) {
+  return (vid.status?.subtitled || []).filter((x) => x.key === key);
+}
+
+function burnJob(key, size) {
+  return (vid.status?.jobs || []).find((j) => j.kind === "burn" && j.key === `burn-${key}-${size}`);
+}
+
+function renderVideoDialog() {
+  const t = activeTranscript();
+  if (!t) {
+    se.dialog.close();
+    return;
+  }
+  const s = vid.status;
+  const speakers = t.speakers ? `, with ${t.speakers} speaker${t.speakers === 1 ? "" : "s"} named` : "";
+  se.videoInfo.textContent = `Subtitles from ${t.label}${t.language ? ` (${languageNames(t.language)})` : ""}${speakers}, `
+    + "at most two lines and six seconds each.";
+  // Rough guides from an 8-core Apple Silicon Mac under Podman: the 360p copy re-encodes about
+  // 30 times faster than real time, a 1080p original about 10 times, larger frames slower
+  const dur = s?.duration || 0;
+  const px = (s?.info?.video?.width || 1920) * (s?.info?.video?.height || 1080);
+  se.video360.textContent = dur ? `About ${formatDuration(Math.max(5, dur / 25) * 1000)}.` : "";
+  se.videoFull.textContent = dur
+    ? `About ${formatDuration(Math.max(10, (dur / 8) * Math.max(0.3, px / (1920 * 1080))) * 1000)}, and up to as much disk as the original.`
+    : "";
+  const done = subtitledOf(sp.active);
+  se.videoDone.replaceChildren(...done.map((x) => {
+    const del = h("button", { type: "button", title: "Delete this video" }, "×");
+    const get = h("button", { type: "button", class: "link" }, "Download");
+    get.addEventListener("click", () => download(`/api/video/${vid.id}/subtitled/${x.name}`)); // video.js
+    del.addEventListener("click", async () => {
+      try {
+        await vFetch(`/api/video/${vid.id}/subtitled/${x.name}`, { method: "DELETE" });
+      } catch (e) {
+        se.videoError.textContent = e.message;
+      }
+      await pollNow();
+    });
+    return h("div", {}, h("span", { class: "meta" }, `Burned in, ${x.size === "360" ? "360p" : "original size"} · ${fmtBytes(x.bytes)}`), get, del);
+  }));
+  const mode = videoDialogMode();
+  const job = mode !== "track" && burnJob(sp.active, mode);
+  const ready = mode !== "track" && done.some((x) => x.size === mode);
+  se.videoGo.disabled = !!job;
+  se.videoGo.textContent = mode === "track" || ready ? "Download"
+    : job ? (job.state === "queued" ? "Queued…" : `Burning in… ${Math.floor(job.progress * 100)}%`)
+      : "Start";
+}
+
+se.video.addEventListener("click", () => {
+  if (!activeTranscript()) return;
+  se.videoError.textContent = "";
+  renderVideoDialog();
+  se.dialog.showModal();
+});
+se.videoCancel.addEventListener("click", () => se.dialog.close());
+se.form.addEventListener("change", renderVideoDialog);
+
+se.form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const key = sp.active;
+  if (!key) return;
+  const mode = videoDialogMode();
+  se.videoError.textContent = "";
+  if (mode === "track") {
+    download(`/api/video/${vid.id}/transcripts/${key}/video`); // video.js
+    se.dialog.close();
+    return;
+  }
+  const ready = subtitledOf(key).find((x) => x.size === mode);
+  if (ready) {
+    download(`/api/video/${vid.id}/subtitled/${ready.name}`);
+    se.dialog.close();
+    return;
+  }
+  try {
+    await vPost(`/api/video/${vid.id}/transcripts/${key}/burn`, { size: mode });
+    vStatus("Burning in subtitles: the job runs on the server; press Video again to download it when it's done.");
+    se.dialog.close();
+  } catch (err) {
+    se.videoError.textContent = err.message;
+  }
+  await pollNow();
+});
 
 // ---------- shared with video.js and video-tag.js ----------
 // One row per transcript under the timeline, beside the detectors' rows: where there is speech
@@ -398,15 +606,40 @@ function speechTracks() {
     });
     rows.push({ row, canvas: row.querySelector("canvas"), spans: t.spans, active: t.key === sp.active });
   }
+  const shownTrack = (vid.status?.transcripts || []).find((t) => t.key === sp.active)?.params.track || 0;
+  for (const x of vid.status?.speakers || []) {
+    const del = h("button", { type: "button", title: "Delete these speakers" }, "×");
+    const row = h("div", {
+      class: "v-track v-track-speakers" + (sp.active && x.track === shownTrack ? " active" : ""),
+      title: `${x.count} speaker${x.count === 1 ? "" : "s"}${x.params?.speakers ? " (number given)" : ""}, one colour each.`,
+    },
+    h("span", { class: "v-track-label" },
+      h("strong", {}, "Speakers"),
+      h("span", { class: "meta" }, `${x.count} found${x.track ? ` · track ${x.track + 1}` : ""}`)),
+    h("canvas", {}), del);
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteSpeakers(x);
+    });
+    rows.push({ row, canvas: row.querySelector("canvas"), bands: x.bands, active: sp.active && x.track === shownTrack });
+  }
   return rows;
+}
+
+// How a running job of this panel is named on its timeline row, or null for other jobs
+function speechJobLabel(job) {
+  if (job.kind === "transcribe") return { title: "Speech", meta: job.label.replace(/^Whisper /, "") };
+  if (job.kind === "diarize") return { title: "Speakers", meta: "" };
+  if (job.kind === "burn") return { title: "Subtitles", meta: job.label.replace(/^Subtitles · /, "") };
+  return null;
 }
 
 function speechHoverText(t) {
   const tr = activeTranscript();
   const i = tr ? segmentAt(tr.segments, t) : -1;
   if (i < 0) return "";
-  const text = tr.segments[i].text;
-  return ` · “${text.length > 70 ? `${text.slice(0, 68)}…` : text}”`;
+  const { text, speaker } = tr.segments[i];
+  return ` · ${speaker != null ? `${speakerName(speaker)}: ` : ""}“${text.length > 70 ? `${text.slice(0, 68)}…` : text}”`;
 }
 
 function speechExportKey() {

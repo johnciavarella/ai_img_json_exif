@@ -111,10 +111,19 @@ async def vision_models():
 
 @app.post("/api/vision/classify")
 async def vision_classify(body: dict):
+    return await _proxy_vision("/classify", body)
+
+
+@app.post("/api/vision/embed")
+async def vision_embed(body: dict):
+    return await _proxy_vision("/embed", body)
+
+
+async def _proxy_vision(path: str, body: dict):
     # First use of a model downloads its weights, so allow the same generous timeout
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            r = await client.post(f"{VISION_BASE_URL}/classify", json=body)
+            r = await client.post(f"{VISION_BASE_URL}{path}", json=body)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"detail": f"{type(e).__name__}: {e}"}, status_code=502)
     try:

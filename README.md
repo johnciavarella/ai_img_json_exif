@@ -1,292 +1,315 @@
-# LLM Image Classifier
+# LLM Image & Video Classifier
 
-A self-hosted web app for classifying photos with local models and writing the results into their metadata, and for splitting long videos into scenes, transcribing their speech and tagging each scene.
+A self-hosted, local-first web app and CLI for organizing and analyzing visual media with local AI models. Classify photos, search by semantic meaning, write tags into EXIF/IPTC/XMP metadata non-destructively, split long videos into scenes, and transcribe speech with Whisper.
 
-![The Single model tab: RT-DETRv2 has boxed two people, two bicycles and a boat, with the JSON result on the right and the photo's EXIF below](docs/screenshot.jpg)
+---
+
+## Index
+
+- [Use Cases](#use-cases)
+  - [1. Photo Organization & Metadata Tagging](#1-photo-organization--metadata-tagging)
+  - [2. Video Scene Detection & Speech Transcription](#2-video-scene-detection--speech-transcription)
+- [Quickstart](#quickstart)
+  - [Prerequisite: Local Vision Model](#prerequisite-local-vision-model)
+  - [1. Docker](#1-docker)
+  - [2. Python Virtual Environment (Env)](#2-python-virtual-environment-env)
+  - [3. Apple Containers (Podman / OrbStack)](#3-apple-containers-podman--orbstack)
+  - [Apple `container` (no Docker)](#apple-container-no-docker)
+  - [4. Mac / Desktop App (Electron)](#4-mac--desktop-app-electron)
+  - [5. Command Line (CLI)](#5-command-line-cli)
+- [How to Use Guide](#how-to-use-guide)
+  - [Single Photo Analysis](#single-photo-analysis)
+  - [Workflows (Chaining Models)](#workflows-chaining-models)
+  - [Batch Processing & Similarity Search](#batch-processing--similarity-search)
+  - [Metadata Export](#metadata-export)
+  - [Video Scene Detection & Transcription](#video-scene-detection--transcription)
+  - [Tagging Video Scenes](#tagging-video-scenes)
+- [Suggested Models](#suggested-models)
+  - [Recommended Vision LLMs](#recommended-vision-llms)
+  - [Dedicated Vision Models](#dedicated-vision-models)
+  - [Whisper Speech Models](#whisper-speech-models)
+- [Documentation Index](#documentation-index)
+- [License](#license)
+
+---
+
+## Use Cases
+
+### 1. Photo Organization & Metadata Tagging
+
+Use local Multimodal LLMs (like Qwen or Gemma) alongside fast computer vision models (SigLIP 2, EfficientNetV2, ResNet-50, RT-DETRv2) to understand your photo collection.
+
+- **Non-Destructive Tagging:** Writes categories, captions, ratings, and tags directly into EXIF, IPTC, and XMP tags on file copies—leaving your originals untouched.
+- **Semantic Search & Similarity:** Groups near-duplicates and visually similar photos automatically with SigLIP 2 embeddings, or search using plain English descriptions (`like:"kids playing in snow"`).
+- **Batch Processing:** Run multi-model workflows over entire directories with progress tracking, pause/resume, and instant filtering.
+
+![Single photo view: RT-DETRv2 detecting objects with EXIF data below and structured JSON on the right](docs/screenshot.jpg)
 
 *Photo: [Retired electrician](https://commons.wikimedia.org/wiki/File:Moscow_2025-08-10_bicycle_race,_sidewalk_02.jpg), CC0, via Wikimedia Commons.*
 
-- **LLM backend**: any OpenAI-compatible vision model, such as llama.cpp's `llama-server`. You write the prompt, and the app shows the raw output next to the parsed JSON.
-- **Vision backend**: dedicated image models in a second container. SigLIP 2 scores your own labels, EfficientNetV2 and ResNet-50 use the ImageNet classes, and RT-DETRv2 detects objects.
-- **Workflows** chain several models together. **Batch** runs a whole folder. **Export** writes the results into EXIF, XMP and IPTC tags on a copy of each photo.
-- **Video Classifier** (switch in the page title) splits videos of any length into scenes with TransNetV2, PySceneDetect or FFmpeg, transcribes their speech with Whisper, tags every scene with a model or workflow, and exports the scene list with each scene's thumbnail, words and JSON.
+---
 
-Both backends return the same top-level JSON (`category`, `tags`, `confidence`), so their results compare directly. A walkthrough on first load explains each setting; press **?** to replay it. Drag the gaps between panels and columns to resize them, and double-click a gap to reset it.
+### 2. Video Scene Detection & Speech Transcription
 
-## Quick start
+Process videos of any length without loading entire files into memory.
 
-1. Start an OpenAI-compatible server with a vision model (see [Recommended LLM models](#recommended-llm-models)). With llama.cpp, `-hf` downloads a model and its `mmproj` file, which lets it see images:
+- **Scene Detection:** Detect hard cuts, dissolves, and fades using TransNetV2, PySceneDetect, or FFmpeg with instant real-time threshold tuning.
+- **Audio Transcription:** Automatically transcribe spoken audio with timestamped subtitles (SRT, VTT, JSON) using faster-whisper.
+- **Speaker Diarization:** Identify who speaks when with pyannote.audio, so transcript lines, subtitles, and the timeline show each speaker.
+- **Video with Subtitles:** Download the original video with the transcript as a switchable subtitle track (MKV), or burned into the picture (MP4).
+- **Scene Tagging & Export:** Classify scene keyframes using your LLM/vision workflows and download complete packages with thumbnails, speech transcripts, and CSV/JSON summaries.
 
-   ```sh
-   llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF --host 0.0.0.0 --port 8080
-   ```
+![Video Classifier view: NASA video split into scenes with threshold curve, speech activity, and Whisper transcript](docs/screenshot-video.jpg)
 
-   For a model you already have, pass both files: `llama-server -m model.gguf --mmproj mmproj.gguf --host 0.0.0.0 --port 8080`.
+*Video: [Why Did NASA Choose Asteroid Bennu?](https://svs.gsfc.nasa.gov/14398), NASA SVS, Public Domain via [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Why_Did_NASA_Choose_Asteroid_Bennu-_(SVS14398).webm).*
 
-2. Point the app at it and start it:
+---
 
-   ```sh
-   echo 'LLM_BASE_URL=http://host.docker.internal:8080/v1' > .env
-   docker compose up --build -d
-   ```
+## Quickstart
 
-   On macOS, [Apple's own container runtime](#apple-containers) runs the same app with no Docker Desktop, Podman or Colima at all:
-
-   ```sh
-   brew install container && container system start
-   ./scripts/apple-container.sh up
-   ```
-
-   Skip the `.env` line for that one. The script finds the Mac's address by itself, and the same `Containerfile` and the same `compose.yaml` are used either way.
-
-3. Open <http://localhost:8090>.
-
-On Linux, `host.docker.internal` needs `extra_hosts: ["host.docker.internal:host-gateway"]` in `compose.yaml`. Alternatively, use the host's IP address.
-
-> **No authentication.** Run the app on a trusted network only. Photos are sent only to the model servers you configure.
-
-## Apple containers
-
-Apple's own [`container`](https://github.com/apple/container) runs the app without Docker Desktop, one lightweight VM per container. `Containerfile` is the same one Docker builds from.
+### Prerequisite: Local Vision Model
+Start any OpenAI-compatible server with a vision model (e.g. via `llama.cpp` or `ollama`):
 
 ```sh
-brew install container
-container system start
-./scripts/apple-container.sh up
+# Using llama-server:
+llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF --host 0.0.0.0 --port 8080
+
+# Or using Ollama:
+ollama run qwen2.5-vl
 ```
 
-Open <http://127.0.0.1:8090>. The script takes `build`, `up`, `down`, `ps`, `logs [web|vision|video]` and `url`, and reads the same `.env` as `compose.yaml`. Nothing else to set up: the script works out for itself how to reach a model server on the Mac (see **Host access** below), and that is the only part of `docker compose` this cannot take verbatim.
+---
 
-`container` behaves differently from `docker compose` in six ways, and each one needs handling:
+### 1. Docker
+Fastest multi-service setup (Web UI + Vision + Video):
 
-| | Docker and Podman | Apple `container` |
-| --- | --- | --- |
-| Service addresses | `http://vision:8000`, `http://video:8001` | the containers' IP addresses, read at start |
-| `/videos` | the `video-data` volume | a host folder, `video-data/` by default, bind mounted |
-| Caches and saved workflows | volumes, writable straight away | volumes, given to the app's uid on first use |
-| CPU and memory | one VM for everything | set per container by the script |
-| Restart after a reboot | `restart: unless-stopped` | none; run `./scripts/apple-container.sh up` again |
-| Compose | built in | none; the script takes its place |
+**`.env` options for Docker:**
+```env
+# Required: LLM endpoint (host.docker.internal reaches the host on macOS/Windows)
+LLM_BASE_URL=http://host.docker.internal:8080/v1
 
-- **Service addresses.** `container` resolves one container's name from another only when a DNS domain is registered ([apple/container#1809](https://github.com/apple/container/issues/1809)), and there is no `--add-host`. The script reads each service's IP after starting it and passes that to the web app. Container IPs change when a VM restarts, so run `up` again after a reboot.
-- **One folder, not one volume.** A named volume can be attached to only one container at a time, and the web app and the video service both need `/videos`; the second one fails with `The storage device attachment is invalid`. A bind mount can be shared, so `/videos` is a host folder. Set `VIDEO_DATA=/Volumes/Media/video-data` in `.env` to move it off the boot disk, as you would for Docker.
-- **Permissions.** Docker gives a fresh volume the ownership of the image folder it covers; `container` starts every volume empty and root-owned, and model loading then fails with `PermissionError: /cache/hf`. The script chowns `/cache` and `/data` to uid 1001 once, the first time.
-- **Sizes.** `container` gives every container 4 CPUs and 1 GB of RAM unless told otherwise. SigLIP 2 alone needs about 1.5 GB, so the script gives the vision and video services every core and 8 GB each, and the web app 2. Lower them with `VISION_CPUS`, `VISION_MEMORY`, `VIDEO_CPUS`, `VIDEO_MEMORY`, `APP_CPUS` and `APP_MEMORY` in `.env`.
-- **Builds.** `container build` runs in a helper container that defaults to 2 CPUs and 2 GB, which is thin for torch. `scripts/apple-container.sh build` widens it first.
-- **Host access.** `host.containers.internal` is Podman's; Apple container has no such name, and the containers' own network is not the Mac's. A container reaches a model server on the Mac at the Mac's own address, so start it on every interface — `--host 0.0.0.0` in the Quick start above already does — and the script substitutes that address into `LLM_BASE_URL` for you, because `LLM_BASE_URL` defaults to `http://host.container.internal:8080/v1`. A `.env` that sets `LLM_BASE_URL` to anything else is left alone, so the `.env` you use with Docker carries over unchanged.
-  - `host.container.internal` also works, as a DNS domain you register with `sudo container system dns create host.container.internal --localhost 203.0.113.113`. Two reasons not to: it needs a sudo password, and **it turns iCloud Private Relay off on your Mac**. It also has to be registered again after every reboot. To delete one you have registered: `sudo container system dns delete host.container.internal`.
-  - Worth knowing which is which: the domain reaches a server bound to `127.0.0.1`, the Mac's address does not, and the Mac's address reaches a server bound to `0.0.0.0` from anywhere on your network rather than only from this Mac. Bind your model server to `0.0.0.0` only on a network you trust.
-- **Speed.** Level with Docker Desktop, and 0.95× faster over all four vision models. See [Speed](#speed) below for the numbers and how they were taken.
+# Optional overrides:
+# LLM_API_KEY=your-api-key          # Optional bearer token
+# LLM_TIMEOUT=300                  # Request timeout in seconds
+# VIDEO_DATA=/path/to/host/videos   # Host path to store videos (bypasses VM disk limits)
+# VIDEO_RETENTION_DAYS=7           # Auto-delete video temp files after N days
+# VISION_MAX_LOADED=2              # Max vision models in RAM at once
+```
 
-[container-compose](https://github.com/mcrich23/container-compose) does read `compose.yaml`, and mostly works, but it drops `cpus`, `ulimits` and restart policies and patches hosts files to stand in for service names, so the script is the better path. `compose.yaml` now carries an explicit `name:`, which `container-compose` needs: it takes the project name from the folder otherwise, and prefixes volumes with an underscore, which `container` rejects when the folder itself starts with a `.` or `_`.
+**Commands:**
+```sh
+echo 'LLM_BASE_URL=http://host.docker.internal:8080/v1' > .env
+docker compose up --build -d
+```
+Open **<http://localhost:8090>** in your browser.
 
-### Speed
+> On Linux, add `extra_hosts: ["host.docker.internal:host-gateway"]` to `compose.yaml` if connecting to host services.
 
-Nothing about the models changes between runtimes — the same `Containerfile`, the same wheels, the same CPU. Measured on a 16-core Apple silicon Mac (macOS 27.0.1, 64 GB), over a folder of 12 photos, restarting the stack between every measurement and alternating the two runtimes so that whatever else the machine was doing hit both equally. Median of four rounds, per photo, in milliseconds:
+---
 
-| | Apple `container` | Docker Desktop | |
-| --- | ---: | ---: | ---: |
-| Read EXIF | 133 | 132 | 1.01× |
-| EfficientNetV2-S | 265 | 254 | 1.05× |
-| ResNet-50 | 152 | 144 | 1.06× |
-| SigLIP 2 | 707 | 779 | **0.91×** |
-| RT-DETRv2-S | 399 | 468 | **0.85×** |
-| **All four models** | **1528** | **1603** | **0.95×** |
-| Write metadata | 273 | 270 | 1.01× |
+### 2. Python Virtual Environment (Env)
+Run natively on bare-metal Python without containers:
 
-Apple `container` comes out ahead on the two heaviest models and level on the rest, 0.95× over all four. Results were identical, not just timings: the same category for every photo from every model, 716 EXIF tags read and 72 tags written per round, and no errors in any of the eight runs. Docker Desktop's VM had 8 CPUs and 7.6 GB, which is its default for this machine; the script gives each container every core and 8 GB.
+**`.env` options for Python:**
+```env
+# Required: local LLM server endpoint
+LLM_BASE_URL=http://localhost:8080/v1
 
-Two caveats worth the space:
+# Optional (if running auxiliary vision/video services locally):
+# VISION_BASE_URL=http://localhost:8000
+# VIDEO_BASE_URL=http://localhost:8001
+# LLM_API_KEY=
+# LLM_TIMEOUT=300
+```
 
-- **Give the machine a rest first.** Three VMs share the same physical cores, so if anything else on the Mac is busy both runtimes lose most of their speed, and the gap between them grows to two or three times over. The table above is what you get when the machine is otherwise idle, and the spread within each runtime is wide: ResNet-50 ranged from 79 to 161 ms on Apple `container` across four identical rounds.
-- **Benchmark against a runtime you know.** Single runs are not comparable to each other on a busy machine. If you re-measure, alternate the two and compare medians, or the number you get will be an artefact of when it ran.
+**Commands:**
+```sh
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-## Recommended LLM models
+LLM_BASE_URL=http://localhost:8080/v1 uvicorn app.main:app --port 8090
+```
+Open **<http://localhost:8090>**.  
+*(See [Local Environment Guide](docs/local-environment.md) to run auxiliary vision and video services locally).*
 
-Any model that accepts images works. These are good places to start: all are Apache-2.0, run in llama.cpp, and are ready to download with `-hf` (4-bit, with their `mmproj`):
+---
 
-| Model                | Download | Good for                                                                         | `llama-server`                         |
-| -------------------- | -------- | -------------------------------------------------------------------------------- | -------------------------------------- |
-| Gemma 4 E4B          | 5 GB     | Quick categories, tags and captions on a laptop                                  | `-hf ggml-org/gemma-4-E4B-it-GGUF`     |
-| Qwen3-VL 8B Instruct | 6 GB     | Reading text in photos (signs, documents, screenshots); answers without thinking | `-hf Qwen/Qwen3-VL-8B-Instruct-GGUF`   |
-| Qwen3.5 9B           | 7 GB     | A newer all-rounder of the same size; thinks first                               | `-hf unsloth/Qwen3.5-9B-GGUF`          |
-| Gemma 4 26B A4B      | 15 GB    | Richer descriptions; a mixture of experts, so faster than its size suggests      | `-hf ggml-org/gemma-4-26B-A4B-it-GGUF` |
-| Qwen3.6 35B A3B      | 21 GB    | The most capable of these, and fast for its size; thinks first                   | `-hf ggml-org/Qwen3.6-35B-A3B-GGUF`    |
+### 3. Apple Containers (Podman / OrbStack)
+Optimized for Apple Silicon macOS using Podman or OrbStack:
 
-- **Memory:** allow the download size plus 2–3 GB of RAM or VRAM. On Apple Silicon, llama.cpp runs on the GPU in shared memory.
-- **Thinking models** reason before they answer, which takes longer and can use up **Max tokens** (1024 by default) before any JSON arrives. Start llama-server with `--reasoning off`, or raise Max tokens to 4096 or more.
-- **Context:** a photo at 1536 px can take over 1,500 tokens of context in the Qwen models. If a request fails for lack of context, add `-c 8192`.
-- **Ollama and LM Studio** offer the same families. Ollama's endpoint is `http://host.docker.internal:11434/v1`; type the model's name in the Model field.
-- More models are listed in [llama.cpp's multimodal docs](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md).
+**`.env` options for Apple Containers:**
+```env
+# Required: Podman routes host traffic through host.containers.internal
+LLM_BASE_URL=http://host.containers.internal:8080/v1
 
-## Configuration
+# Recommended: store videos on host filesystem to avoid Podman VM disk limits
+# VIDEO_DATA=/Volumes/Media/video-data
+# VIDEO_RETENTION_DAYS=7
+```
 
-| Variable               | Default                                   | Purpose                                                                  |
-| ---------------------- | ----------------------------------------- | ------------------------------------------------------------------------ |
-| `LLM_BASE_URL`         | `http://host.containers.internal:8080/v1` | Default LLM endpoint, editable in the UI; set it as in Quick start       |
-| `LLM_API_KEY`          | *(empty)*                                 | Bearer token, if your server needs one                                   |
-| `LLM_TIMEOUT`          | `300`                                     | Request timeout in seconds                                               |
-| `VISION_MAX_LOADED`    | `2`                                       | Vision models kept in RAM; the least recently used one is unloaded first |
-| `VIDEO_DATA`           | `video-data` (a volume)                   | Where uploaded videos are kept; a host path makes it a bind mount        |
-| `VIDEO_RETENTION_DAYS` | `7`                                       | Days a video is kept after it was last opened                            |
+**Commands:**
+```sh
+echo 'LLM_BASE_URL=http://host.containers.internal:8080/v1' > .env
+podman compose up --build -d
+```
+Open **<http://localhost:8090>**.
 
-UI settings are stored in the browser. Saved workflows live in the `app-data` volume, model weights in `vision-cache` and `video-cache`, and videos in `video-data`.
+---
 
-## Using it
-
-**Single model.** Drop a photo and press **Run** (Cmd/Ctrl+Enter).
-
-- Before upload, the browser scales photos to at most 1536 px.
-- The EXIF panel reads every tag from the original file, including HEIC and RAW.
-- **Force JSON** makes llama.cpp return valid JSON only.
-- The JSON panel ignores `<think>` blocks and code fences when it parses the output.
-- Thinking models' reasoning appears in the LLM output panel ahead of the answer, whether the server sends it as `reasoning_content` (llama.cpp, LM Studio) or `reasoning` (Ollama, vLLM). If a model spends all of **Max tokens** before it answers, the app says so rather than showing an empty result: raise Max tokens, or use a non-thinking model.
-
-**Workflows.** A workflow is an ordered list of vision and LLM steps that run on the server.
-
-- In an LLM prompt, `{{step_id.field}}` inserts an earlier result, e.g. `{{objects.counts.person}}`, `{{scene.summary}}` or `{{exif.DateTimeOriginal}}`.
-- **Run** uses your current edits, even before you save them.
-- Three starter workflows are included.
-
-**Batch.** Choose a folder and every photo in it appears in a grid.
-
-- Borders show each photo's state: grey (not run), green (done), red (failed).
-- **Run all** skips photos that are already done and resumes where it stopped.
-- If a model server goes down, the batch retries, then pauses. Nothing is marked as failed.
-- Results are kept in the browser, so picking the same folder again brings them back.
-- Search, filter, sort and group by any result field or EXIF tag, e.g. `category:portrait people_count>2 exif.Model:"EOS R5"`.
-- **Export all…** downloads a zip of tagged copies, keeping file names and subfolders. If the page closes first, the zip is offered again on the next visit.
-
-## Metadata export
-
-**Export image** downloads a copy of the original, full-size file with the result written into its metadata. Your original is never changed. Known JSON keys, at any depth, map to standard tags:
-
-| JSON key                                            | Tags written                                                                  |
-| --------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `description`, `caption`, `summary`                 | `IFD0:ImageDescription`, `XMP-dc:Description`, `IPTC:Caption-Abstract`        |
-| `title` / `headline`                                | `XMP-dc:Title`, `IPTC:ObjectName` / `XMP-photoshop:Headline`, `IPTC:Headline` |
-| `tags`, `keywords`, `labels`, `objects`, `category` | `XMP-dc:Subject`, `IPTC:Keywords`                                             |
-| `rating` (0–5)                                      | `XMP-xmp:Rating`                                                              |
-| `artist`, `creator`, `author` / `copyright`         | `IFD0:Artist`, `XMP-dc:Creator` / `IFD0:Copyright`, `XMP-dc:Rights`           |
-| `city`, `state`, `country`, `location`, `event`     | `XMP-photoshop:*`, `XMP-iptcCore:Location`, `XMP-iptcExt:Event`               |
-| `people`, `persons`                                 | `XMP-iptcExt:PersonInImage`                                                   |
-
-- The full result JSON is also stored in `UserComment`.
-- Existing values are kept unless you tick **Overwrite existing metadata**.
-- Camera tags (make, model, exposure, dates, GPS) are never written.
-
-## Video scenes
-
-![The Video Classifier's Scenes view: a NASA video about asteroid Bennu, split into 19 scenes by TransNetV2, with its score curve and threshold on the timeline, a Speech row showing where the narrator talks, and the Whisper transcript highlighting the line being spoken](docs/screenshot-video.jpg)
-
-*Video: [Why Did NASA Choose Asteroid Bennu?](https://svs.gsfc.nasa.gov/14398), NASA's Scientific Visualization Studio, public domain, via [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Why_Did_NASA_Choose_Asteroid_Bennu-_(SVS14398).webm).*
-
-Choose **Video Classifier** in the page title. Drop a video, pick a detector and press **Detect scenes**. The video side has its own two views: **Scenes**, for detecting scenes and [transcribing speech](#transcribing-speech), and **Tag scenes**, for [running a model or workflow on every scene](#tagging-scenes). Cmd/Ctrl+Enter runs **Detect scenes**, or **Tag all** in Tag scenes.
-
-- **Any size.** The browser uploads the file in 64 MB chunks straight to the server's disk, so neither side holds the whole video in memory. If the upload stops, choose the same file again and it resumes.
-- **Preparing.** The server first makes a 360p copy of the video. Every detector reads that copy, so trying another detector or threshold doesn't decode the full-size file again, and the copy plays in the browser even when the original's codec doesn't.
-- **Comparing.** Every result is kept. The timeline shows the scenes, the detector's score and its threshold, with one row per result underneath so cuts line up. Click a row to switch to it.
-- **Tuning.** Drag the dashed threshold line to get more or fewer scenes. TransNetV2 and the FFmpeg filter save a score for every frame, so their scenes update as you drag and a new threshold never re-reads the video. PySceneDetect's detectors re-run when you let go.
-- **Export scenes** downloads a zip of `scenes.json`, `scenes.csv` and a 360p thumbnail of every scene. Each scene has its start, end and duration in seconds, timecodes, frame numbers in the original, and its thumbnail's path; the JSON also describes the video and the detector settings. Scenes tagged with the model or workflow chosen in **Tag scenes** also carry its JSON as `metadata` (a JSON column in the CSV), and with a transcript shown, each scene carries its words as `speech`. The **CSV** and **JSON** links above the scene list download the list without thumbnails. The video itself is never cut.
-- Videos are deleted 7 days after you last opened them (`VIDEO_RETENTION_DAYS`), or with **delete** in the Video panel, together with their scene results, tags and transcripts.
-
-| Detector                 | Finds                                    | Notes                                                    |
-| ------------------------ | ---------------------------------------- | -------------------------------------------------------- |
-| TransNetV2               | hard cuts, dissolves, fades              | Neural network; the most accurate                        |
-| PySceneDetect · content  | hard cuts                                | Fast; lower the threshold to find more                   |
-| PySceneDetect · adaptive | hard cuts                                | Fewer false cuts in fast motion and pans                 |
-| PySceneDetect · fades    | fades to and from black                  | Cuts where the picture goes dark                         |
-| FFmpeg scene filter      | hard cuts                                | Rough split; some cuts score low, so try 0.2             |
-
-AutoShot is listed but not available yet: its weights are only published on Baidu Netdisk.
-
-### Transcribing speech
-
-The **Transcript** panel beside the scene list turns the video's speech into timed lines with Whisper ([faster-whisper](https://github.com/SYSTRAN/faster-whisper), on the server's CPU). Choose a model and, if you know it, the language, then press **Transcribe**; otherwise the language is detected from the first speech.
-
-- **Models:** *tiny* and *base* are quick but rough, *small* is a good start, *medium* and *large-v3 turbo* are more accurate and slower, and *large-v3* is the most accurate and slowest. Each downloads once (78 MB to 3 GB) into the `video-cache` volume.
-- **Long videos** are transcribed ten minutes at a time, each piece ending at a quiet moment so no word is cut, and silence is skipped. Every word keeps its own time.
-- **Reading along:** the line being spoken is highlighted as the video plays, and the list follows it unless you have just scrolled. Click a line to jump there. **Search** shows only the lines with those words. A **Speech** row under the timeline shows where people talk; hover the timeline to see the line at that moment.
-- **Downloads:** **SRT** and **VTT** are subtitles (at most two lines and six seconds each, split between words), **TXT** has a time on each line, and **JSON** has every line and word with its times and confidence.
-- **With scenes:** while a transcript is shown, **Export scenes** gives each scene the words spoken in it (`speech`, also a CSV column) and adds `transcript.srt` to the zip, and Tag scenes' workflow prompts get them as `{{exif.Speech}}`.
-- A video with several audio tracks gets a **Track** menu. Each model, language and track keeps its own transcript.
-
-### Tagging scenes
-
-Once the scenes look right, open **Tag scenes** (next to **Scenes** in the header). It is the photo **Batch** tab for the result shown on the timeline, with the same controls:
-
-- **Run with** a single model or a workflow, with the same model, prompt and workflow settings as the image side (they are shared, so a change on one side applies to the other). The prompt or workflow editor and the output panels sit beside the scene grid, as on the Batch tab.
-- Each scene's frame at its thumbnail time is taken from the original video at up to 1536 px, the same size photos are sent at, and run through the model or workflow.
-- **Tag all** runs every scene that has no result yet for these settings; with a search or status filter it becomes **Tag shown**, and **Re-run done** runs the done ones again. Stop at any time and press it again to carry on. If the model server stops answering, it retries, then pauses with the remaining scenes kept.
-- Search, **Sort** and **Group** work as on the photo grid, on the scenes' JSON plus `scene`, `start`, `end`, `duration` and `status`, e.g. `category:landscape duration>5`.
-- Click a scene to see its frame and result, and **Tag scene** to run it again; ← and → move between scenes, Esc goes back to the grid. The strip above the grid shows every scene's status along the video; click it to jump to a scene.
-- Workflow prompts get the scene in place of EXIF: `{{exif.FileName}}`, `{{exif.Scene}}`, `{{exif.SceneStart}}`, `{{exif.SceneEnd}}`, `{{exif.SceneDuration}}`, when the video records it, `{{exif.DateTimeOriginal}}` at the frame's time, and with a transcript shown, `{{exif.Speech}}`: the words spoken in the scene.
-
-Results are saved on the server next to the scenes, per scene and per model or workflow, so each keeps its own, as Batch results do. A green strip on the main timeline marks tagged scenes, the Scenes list shows each scene's description (or category and tags), and **Export scenes** includes the JSON from the model or workflow chosen in Tag scenes. Tags are deleted with their scene result or video.
-
-**Disk space.** A video needs its own size in free space, plus room for the preview copy: usually a few percent more, but up to 15% for noisy footage. Uploads are refused when space is short. Docker Desktop and Podman keep volumes inside their VM, whose disk is often only 60–100 GB. For large videos, put them on the host instead: `echo 'VIDEO_DATA=/Volumes/Media/video-data' >> .env`.
-
-**Speed.** Everything runs on the CPU. As a guide, on an 8-core Apple Silicon Mac under Podman, a 29 GB, 4-hour 1080p video uploaded in about 2 minutes and was prepared in about 6. TransNetV2 processes about 90 frames a second, so it needs about an hour for 4 hours at 25 fps, and more for higher frame rates. The PySceneDetect and FFmpeg detectors read the 360p copy, so they are much quicker. Whisper *small* transcribes about 5 times faster than real time, and *large-v3 turbo* about 3 times, so 4 hours of talk take roughly 50 or 80 minutes; silence is skipped. Jobs run one at a time, in the order they were started.
-
-## Command line
-
-`python -m app.cli` runs the settings you exported from the web UI (**Export settings**) over any number of photos, without the browser:
+### Apple `container` (no Docker)
+Apple's own [`container`](https://github.com/apple/container) runs the same `Containerfile` and `compose.yaml` without Docker Desktop:
 
 ```sh
+brew install container && container system start
+./scripts/apple-container.sh up
+```
+Open **<http://127.0.0.1:8090>**. The script reads the same `.env` and works out the Mac's address itself. See [Apple container guide](docs/apple-container.md) for the differences from Docker and speed numbers.
+
+---
+
+### 4. Mac / Desktop App (Electron)
+Launch as a dedicated desktop window without browser URL bars:
+
+**Options & Setup:**
+- Connects to your local backend (`http://localhost:8090` from Docker or Python Env).
+- Respects the backend `.env` configuration for models and storage paths.
+
+**Commands:**
+```sh
+# Option A: Fast browser app mode (Chrome/Brave):
+open -a "Google Chrome" --args --app="http://localhost:8090"
+
+# Option B: Standalone macOS .app bundle using Nativefier / Electron:
+npx -y nativefier --name "Photo Classifier" "http://localhost:8090"
+```
+*(See [Desktop & Electron Guide](docs/desktop-electron.md) for custom Electron wrappers).*
+
+---
+
+### 5. Command Line (CLI)
+Batch process photos directly from your terminal using exported web UI settings:
+
+**`.env` options for CLI:**
+```env
+# CLI reads .env automatically from the working directory:
+LLM_BASE_URL=http://localhost:8080/v1
+VISION_BASE_URL=http://127.0.0.1:8000
+# LLM_API_KEY=your-api-key
+```
+
+**Commands:**
+```sh
 python3 -m venv .venv-cli && .venv-cli/bin/pip install -r requirements-cli.txt
-docker compose up -d     # the vision service listens on 127.0.0.1:8000 for the CLI
+docker compose up -d vision  # auxiliary vision service on port 8000
 
 .venv-cli/bin/python -m app.cli catalog.settings.json ~/Pictures/Trip --tag --zip
 ```
+*(See [CLI Guide](docs/cli.md) for full command-line arguments and semantic search flags).*
 
-`./scripts/apple-container.sh up` publishes the same `127.0.0.1:8000` when you use [Apple containers](#apple-containers).
+---
 
-| Flag          | Output                                                        |
-| ------------- | ------------------------------------------------------------- |
-| *(default)*   | `results.jsonl`, one line per photo; used to resume           |
-| `--tag`       | tagged copies, keeping names and subfolders, plus `_run.json` |
-| `--zip`       | a zip of the tagged copies, like the Batch tab's Export all   |
-| `--sidecar`   | `<photo>.json` with each photo's result                       |
-| `--overwrite` | replace metadata the photos already have                      |
+## How to Use Guide
 
-- `--tag` and `--zip` need [exiftool](https://exiftool.org/).
-- Output goes to `photo-organizer-runs/<name>`; `-o` chooses another folder.
-- Running the same command again resumes, and `--rerun` starts over.
-- The API key is never saved in the settings file. Pass `--api-key` or set `LLM_API_KEY`.
-- See `--help` for all options.
+### Single Photo Analysis
+1. Drop a photo onto the dropzone (or press `Cmd/Ctrl+O`).
+2. Select a model or workflow from the dropdown.
+3. Review extracted EXIF data, prompt settings, and press **Run** (`Cmd/Ctrl+Enter`).
+4. Output JSON is validated and displayed alongside raw model output.
 
-## Vision models
+### Workflows (Chaining Models)
+Workflows execute a pipeline of vision and LLM tasks:
+- **Variable Interpolation:** Reference earlier steps in downstream prompts, e.g. `{{objects.counts.person}}`, `{{scene.summary}}`, or `{{exif.DateTimeOriginal}}`.
+- **Pre-configured Workflows:** Includes built-in workflows for structured cataloging, deep captioning, and object verification.
 
-| Model              | Kind           | Labels        | Source                                     |
-| ------------------ | -------------- | ------------- | ------------------------------------------ |
-| `siglip2-base`     | zero-shot      | your own list | Google SigLIP 2                            |
-| `efficientnetv2-s` | classification | ImageNet-1k   | `tf_efficientnetv2_s.in21k_ft_in1k` (timm) |
-| `resnet50`         | classification | ImageNet-1k   | `resnet50.a1_in1k` (timm)                  |
-| `rtdetr-v2-s`      | detection      | COCO-80       | `PekingU/rtdetr_v2_r18vd`                  |
+### Batch Processing & Similarity Search
+- **Folder Ingestion:** Select a local directory to populate a thumbnail grid.
+- **State & Resuming:** Color-coded borders show processing states (grey: pending, green: complete, red: failed). Interrupted batches resume automatically.
+- **Smart Grouping:** Toggle **Group › Similar photos** to cluster visually similar images using SigLIP 2 embeddings. Adjust the **Alike** slider (e.g. `0.9` for bursts/duplicates, `0.8` for looser groupings).
+- **Semantic Text Search:** Type `like:"kids at a birthday party"` to rank images by natural language relevance without re-running models.
 
-- **Weights:** each model downloads its weights the first time it's used.
-- **Speed:** models run on CPU, at roughly 40–800 ms per image on an Apple Silicon Mac.
-- **Memory:** SigLIP 2 needs about 1.5 GB of RAM. If the container runs out of memory, give Docker more or set `VISION_MAX_LOADED=1`.
-- **Adding a model:** add a `Spec` to `SPECS` in [vision/server.py](vision/server.py).
-- **Licences:** all model code and weights are Apache-2.0 or BSD. The ImageNet classifiers were trained on ImageNet, whose terms are for non-commercial research.
-- **Video detectors:** TransNetV2 ([soCzech/TransNetV2](https://github.com/soCzech/TransNetV2), MIT) is vendored in [video/transnetv2.py](video/transnetv2.py), and its PyTorch weights download on first use. PySceneDetect is BSD-3-Clause. FFmpeg comes from Debian's packages.
-- **Speech:** faster-whisper and its Silero VAD are MIT, as are the Whisper weights; they download on first use, pinned to a revision ([video/transcribe.py](video/transcribe.py)).
+### Metadata Export
+- Click **Export image** or **Export all…** in Batch view.
+- Tagged copies are produced with predictions written to `ImageDescription`, `Keywords`, `Subject`, `Rating`, `City`, `Event`, and `PersonInImage`.
+- Originals are strictly read-only and never modified.  
+*(See [Metadata Export Mapping](docs/metadata-export.md) for tag specifications).*
 
-## Development
+### Video Scene Detection & Transcription
+1. Switch to **Video Classifier** in the top navigation and drop a video file.
+2. Select a detector (**TransNetV2**, **PySceneDetect**, or **FFmpeg**) and click **Detect scenes**.
+3. Drag the dashed threshold line on the timeline to interactively tune scene boundaries.
+4. Open the **Transcript** tab, select a Whisper model, and click **Transcribe** to generate time-aligned subtitles.
+5. Click **Identify speakers** to label who is talking (requires a one-time [Hugging Face token](docs/video-classifier.md#speaker-diarization-pyannote)). Choose **Auto speakers** or a fixed count; every transcript of that audio track then shows its speakers.
+6. Click **Video** to download the video with subtitles, either as a subtitle track you can toggle in the player (instant, full quality) or burned into the picture at 360p or original size.
 
-```sh
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-LLM_BASE_URL=http://localhost:8080/v1 uvicorn app.main:app --reload --port 8090
-```
+### Tagging Video Scenes
+1. Switch to **Tag scenes** to inspect individual scene frames.
+2. Click **Tag all** to run your chosen vision model or workflow across every scene.
+3. Use `{{exif.Speech}}` in prompts to pass the transcribed spoken audio for each scene directly to the LLM.
+4. Export a complete zip containing scene thumbnails, `scenes.json`, `scenes.csv`, and SRT subtitles.
 
-To work on the video side outside the containers, run the video service as well. It needs ffmpeg and the packages in [video/requirements.txt](video/requirements.txt) plus torch. Both processes must share one videos folder:
+---
 
-```sh
-(cd video && VIDEO_DIR=../data/videos VIDEO_CACHE=../data/cache uvicorn server:app --port 8001) &
-VIDEO_DIR=data/videos VIDEO_BASE_URL=http://localhost:8001 uvicorn app.main:app --reload --port 8090
-```
+## Suggested Models
+
+### Recommended Vision LLMs
+All recommended models are Apache-2.0, support multimodal vision input, and run directly in `llama.cpp` using `-hf` or in Ollama / LM Studio:
+
+| Model | Download | Recommended For | `llama-server` Flag |
+|---|---|---|---|
+| **Gemma 4 E4B** | 5 GB | Fast tagging, captions, and categorization on laptops | `-hf ggml-org/gemma-4-E4B-it-GGUF` |
+| **Qwen3-VL 8B Instruct** | 6 GB | Reading text in images (OCR, signs, documents); direct answers | `-hf Qwen/Qwen3-VL-8B-Instruct-GGUF` |
+| **Qwen3.5 9B** | 7 GB | High-quality reasoning and rich scene descriptions | `-hf unsloth/Qwen3.5-9B-GGUF` |
+| **Gemma 4 26B A4B** | 15 GB | Mixture-of-Experts architecture; fast inference with detailed output | `-hf ggml-org/gemma-4-26B-A4B-it-GGUF` |
+| **Qwen3.6 35B A3B** | 21 GB | State-of-the-art vision understanding and complex scene reasoning | `-hf ggml-org/Qwen3.6-35B-A3B-GGUF` |
+
+> **Tips:**
+> - **Context Window:** Images at 1536 px require ~1,500 context tokens. Add `-c 8192` to your `llama-server` command.
+> - **Thinking Models:** For models that think before answering, raise **Max tokens** to 4096 or start the server with `--reasoning off`.
+> - **Ollama:** Use `http://host.docker.internal:11434/v1` as your base URL.
+
+### Dedicated Vision Models
+Lightweight CPU models hosted in the auxiliary `vision` service:
+
+| Model | Function | Description |
+|---|---|---|
+| `siglip2-base` | Zero-shot & Embeddings | Scores custom label sets and generates 768-d vectors for similarity search |
+| `efficientnetv2-s` | Classification | Fast ImageNet-1k classification |
+| `resnet50` | Classification | Standard ImageNet-1k benchmark classifier |
+| `rtdetr-v2-s` | Object Detection | Real-time object detection and bounding boxes across 80 COCO classes |
+
+### Whisper Speech Models
+CPU-optimized speech transcription in the `video` service via `faster-whisper`:
+
+| Model | Size | Speed vs Accuracy |
+|---|---|---|
+| `tiny` / `base` | 78–145 MB | Fastest; best for quick previews or clear audio |
+| `small` | 488 MB | **Recommended default:** Excellent balance of speed and precision |
+| `medium` | 1.5 GB | Higher precision for complex terminology or accents |
+| `large-v3 turbo` | 1.6 GB | Near large-v3 quality with significantly improved inference speed |
+| `large-v3` | 3.1 GB | Maximum transcription fidelity |
+
+### Speaker Diarization Models
+Speaker identification in the `video` service via [pyannote.audio](https://github.com/pyannote/pyannote-audio) `speaker-diarization-3.1` (33 MB, CPU). The models are gated on Hugging Face: accept the terms of [`pyannote/speaker-diarization-3.1`](https://hf.co/pyannote/speaker-diarization-3.1) and [`pyannote/segmentation-3.0`](https://hf.co/pyannote/segmentation-3.0), then set `HF_TOKEN` in `.env`. The token is only needed for the first download.
+
+---
+
+## Documentation Index
+
+Detailed guides are available in the [`docs/`](docs/) directory:
+
+- [Configuration & Environment Variables](docs/configuration.md) — Port settings, volumes, retention policies, and tuning.
+- [CLI Reference](docs/cli.md) — Command-line flags, automated batch runs, embeddings, and semantic queries.
+- [Video Classifier & Scene Detection](docs/video-classifier.md) — Scene detectors, Whisper models, speaker identification, subtitled video, and video storage.
+- [Metadata Export Mapping](docs/metadata-export.md) — EXIF, IPTC, and XMP tag mapping rules and safety protections.
+- [Dedicated Vision Models](docs/vision-models.md) — Architecture, memory limits, and adding custom vision models.
+- [Local Environment Setup](docs/local-environment.md) — Step-by-step instructions for running without containers.
+- [Apple `container`](docs/apple-container.md) — Running under Apple's container runtime, how it differs from Docker, and speed.
+- [Desktop App & Electron](docs/desktop-electron.md) — Packaging as a native desktop window on macOS.
+
+---
 
 ## License
 
 [MIT](LICENSE)
+
+Model licences: the speaker-embedding weights used by pyannote (`wespeaker-voxceleb-resnet34-LM`) are [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/), so attribution is required if you redistribute them; pyannote.audio, `segmentation-3.0`, and the 3.1 pipeline are MIT. Whisper and faster-whisper are MIT.

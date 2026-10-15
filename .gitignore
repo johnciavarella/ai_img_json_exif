@@ -28,3 +28,7 @@ photo-organizer-runs/
 exports/
 # local video uploads (VIDEO_DATA)
 video-data/
+
+#other
+renovate.json
+.env

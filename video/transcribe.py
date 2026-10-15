@@ -205,23 +205,29 @@ LINE_CHARS = 42
 
 
 def cues(segments: list) -> list:
-    """Subtitle cues of at most two lines and CUE_SECONDS, split at word boundaries."""
+    """Subtitle cues of at most two lines and CUE_SECONDS, split at word boundaries, as
+    (start, end, text, speaker); speaker is None without diarization."""
     out = []
     for s in segments:
+        who = s.get("speaker")
         words = s.get("words") or []
         if not words:
-            out.append((s["start"], s["end"], s["text"]))
+            out.append((s["start"], s["end"], s["text"], who))
             continue
         cur = []
         for w in words:
             text = "".join(x["word"] for x in cur + [w]).strip()
             if cur and (len(text) > CUE_CHARS or w["end"] - cur[0]["start"] > CUE_SECONDS):
-                out.append((cur[0]["start"], cur[-1]["end"], "".join(x["word"] for x in cur).strip()))
+                out.append((cur[0]["start"], cur[-1]["end"], "".join(x["word"] for x in cur).strip(), who))
                 cur = []
             cur.append(w)
         if cur:
-            out.append((cur[0]["start"], cur[-1]["end"], "".join(x["word"] for x in cur).strip()))
-    return [(a, b, wrap(t)) for a, b, t in out if t]
+            out.append((cur[0]["start"], cur[-1]["end"], "".join(x["word"] for x in cur).strip(), who))
+    return [c for c in out if c[2]]
+
+
+def speaker_name(n) -> str:
+    return f"Speaker {n}"
 
 
 def wrap(text: str) -> str:
@@ -245,13 +251,47 @@ def stamp(sec: float, sep: str) -> str:
 
 
 def to_srt(segments: list) -> str:
-    return "\n".join(f"{i}\n{stamp(a, ',')} --> {stamp(b, ',')}\n{t}\n"
-                     for i, (a, b, t) in enumerate(cues(segments), 1))
+    """SRT, naming the speaker on the first cue after each change of speaker."""
+    out = []
+    last = None
+    for i, (a, b, t, who) in enumerate(cues(segments), 1):
+        if who is not None and who != last:
+            t = f"{speaker_name(who)}: {t}"
+        last = who
+        out.append(f"{i}\n{stamp(a, ',')} --> {stamp(b, ',')}\n{wrap(t)}\n")
+    return "\n".join(out)
 
 
 def to_vtt(segments: list) -> str:
-    return "WEBVTT\n\n" + "\n".join(f"{stamp(a, '.')} --> {stamp(b, '.')}\n{t}\n" for a, b, t in cues(segments))
+    """WebVTT, with a voice tag on each cue whose speaker is known."""
+    def text(t, who):
+        t = wrap(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return f"<v {speaker_name(who)}>{t}" if who is not None else t
+
+    return "WEBVTT\n\n" + "\n".join(f"{stamp(a, '.')} --> {stamp(b, '.')}\n{text(t, who)}\n"
+                                       for a, b, t, who in cues(segments))
 
 
 def to_text(segments: list) -> str:
-    return "".join(f"[{stamp(s['start'], '.')[:-4]}] {s['text']}\n" for s in segments)
+    def who(s):
+        return f"{speaker_name(s['speaker'])}: " if s.get("speaker") is not None else ""
+
+    return "".join(f"[{stamp(s['start'], '.')[:-4]}] {who(s)}{s['text']}\n" for s in segments)
+
+
+# ISO 639-2/B codes for Whisper's languages, which Matroska's language tag expects (Whisper
+# gives ISO 639-1). Cantonese has no 639-2 code of its own, so it's tagged as Chinese.
+ISO639_2 = dict(pair.split(":") for pair in """
+af:afr am:amh ar:ara as:asm az:aze ba:bak be:bel bg:bul bn:ben bo:tib br:bre bs:bos ca:cat
+cs:cze cy:wel da:dan de:ger el:gre en:eng es:spa et:est eu:baq fa:per fi:fin fo:fao fr:fre
+gl:glg gu:guj ha:hau haw:haw he:heb hi:hin hr:hrv ht:hat hu:hun hy:arm id:ind is:ice it:ita
+ja:jpn jw:jav ka:geo kk:kaz km:khm kn:kan ko:kor la:lat lb:ltz ln:lin lo:lao lt:lit lv:lav
+mg:mlg mi:mao mk:mac ml:mal mn:mon mr:mar ms:may mt:mlt my:bur ne:nep nl:dut nn:nno no:nor
+oc:oci pa:pan pl:pol ps:pus pt:por ro:rum ru:rus sa:san sd:snd si:sin sk:slo sl:slv sn:sna
+so:som sq:alb sr:srp su:sun sv:swe sw:swa ta:tam te:tel tg:tgk th:tha tk:tuk tl:tgl tr:tur
+tt:tat uk:ukr ur:urd uz:uzb vi:vie yi:yid yo:yor zh:chi yue:chi
+""".split())
+
+
+def iso639_2(code: Optional[str]) -> str:
+    return ISO639_2.get(code or "", "und")

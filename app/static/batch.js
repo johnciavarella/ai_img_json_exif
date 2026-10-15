@@ -49,16 +49,18 @@ const b = {
 
 // ---------- saved results (IndexedDB) ----------
 // "results" holds full records, "status" a small ok flag per key so the grid can colour every
-// tile without loading every record, and "exif" each photo's flat EXIF (keyed by photo only).
+// tile without loading every record, "exif" each photo's flat EXIF (keyed by photo only), and
+// "embeddings" each photo's vector (keyed by embedding model and photo).
 const resultStore = (() => {
   const memory = new Map(); // used when IndexedDB is unavailable, e.g. some private windows
   const memoryExif = new Map();
+  const memoryVectors = new Map();
   let dbPromise = null;
   const open = () => (dbPromise ??= new Promise((resolve) => {
     try {
-      const req = indexedDB.open("photo-organizer", 2);
+      const req = indexedDB.open("photo-organizer", 3);
       req.onupgradeneeded = () => {
-        for (const name of ["results", "status", "exif"]) {
+        for (const name of ["results", "status", "exif", "embeddings"]) {
           if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name);
         }
       };
@@ -108,6 +110,22 @@ const resultStore = (() => {
       const db = await open();
       if (!db) memoryExif.set(fp, flat);
       else await done(db.transaction("exif", "readwrite").objectStore("exif").put(flat, fp));
+    },
+    async getVectors(fps) {
+      const keys = fps.map((fp) => `${EMBED_MODEL}\n${fp}`);
+      const db = await open();
+      let values = keys.map((k) => memoryVectors.get(k));
+      if (db) {
+        const store = db.transaction("embeddings").objectStore("embeddings");
+        values = await Promise.all(keys.map((k) => done(store.get(k))));
+      }
+      return new Map(fps.map((fp, i) => [fp, values[i]]).filter(([, v]) => v));
+    },
+    async putVector(fp, vector) {
+      const key = `${EMBED_MODEL}\n${fp}`;
+      const db = await open();
+      if (!db) memoryVectors.set(key, vector);
+      else await done(db.transaction("embeddings", "readwrite").objectStore("embeddings").put(vector, key));
     },
     async statuses() {
       const db = await open();
@@ -192,6 +210,7 @@ b.input.addEventListener("change", async () => {
 function renderGrid() {
   thumbObserver.disconnect();
   thumbQueue.length = 0;
+  thumbsKept.clear();
   batch.items.forEach((item, i) => {
     item.img = h("img", { alt: "", draggable: "false" });
     item.tile = h("button", { type: "button", class: "tile", title: item.path, dataset: { index: String(i) } },
@@ -228,7 +247,8 @@ function refreshTiles() {
   }
   b.summary.textContent = batch.items.length
     ? `${batch.folder} · ${batch.items.length} photos · ${done} done${failed ? ` · ${failed} failed` : ""} with ${configLabel()}` +
-      (view.filtered ? ` · showing ${view.order.length}` : "")
+      (view.filtered ? ` · showing ${view.order.length}` : "") +
+      (view.like ? ` · ${view.like.neg ? "worst" : "best"} match for "${view.like.text}" first` : "")
     : "";
   // With a filter on, Export works on the photos shown
   b.exportBtn.textContent = view.filtered ? "Export shown…" : "Export all…";
@@ -243,13 +263,30 @@ function updateRunButton() {
 }
 
 // ---------- thumbnails: decoded lazily as tiles scroll into view ----------
+// At most THUMB_KEEP are kept. Past that, the ones longest out of view are dropped and made again if
+// they scroll back, so a folder of any size takes about the same memory.
+const THUMB_KEEP = 300;
 const thumbQueue = [];
+const thumbsKept = new Set(); // photos with a thumbnail, least recently in view first
 let thumbsActive = 0;
 const thumbObserver = new IntersectionObserver((entries) => {
   for (const entry of entries) {
-    if (!entry.isIntersecting) continue;
-    thumbObserver.unobserve(entry.target);
-    thumbQueue.push(batch.items[Number(entry.target.dataset.index)]);
+    const item = batch.items[Number(entry.target.dataset.index)];
+    if (!item) continue;
+    // A photo is in view through its tile or any copy of it that grouping made
+    item.inView ??= new Set();
+    if (!entry.isIntersecting) {
+      item.inView.delete(entry.target);
+      continue;
+    }
+    item.inView.add(entry.target);
+    if (item.thumbUrl) {
+      thumbsKept.delete(item);
+      thumbsKept.add(item);
+    } else if (!item.thumbQueued) {
+      item.thumbQueued = true;
+      thumbQueue.push(item);
+    }
   }
   pumpThumbs();
 }, { root: b.tiles, rootMargin: "400px" });
@@ -257,23 +294,41 @@ const thumbObserver = new IntersectionObserver((entries) => {
 function pumpThumbs() {
   while (thumbsActive < 3 && thumbQueue.length) {
     const item = thumbQueue.shift();
-    if (!item?.tile) continue;
-    if (!item.tile.isConnected) {
-      thumbObserver.observe(item.tile); // filtered out for now; load when it scrolls into view again
-      continue;
-    }
+    item.thumbQueued = false;
+    // Scrolled or filtered away before its turn: it queues again when it comes back
+    if (item.thumbUrl || item.unsupported || !item.inView?.size) continue;
     thumbsActive++;
     makeThumb(item.file)
       .then((url) => {
+        if (batch.items[Number(item.tile.dataset.index)] !== item) return URL.revokeObjectURL(url); // another folder
         item.thumbUrl = url;
-        item.img.src = url;
-        item.clones.forEach((c) => (c.querySelector("img").src = url));
+        setThumb(item, url);
+        thumbsKept.add(item);
+        trimThumbs();
       })
       .catch(() => markUnsupported(item))
       .finally(() => {
         thumbsActive--;
         pumpThumbs();
       });
+  }
+}
+
+function setThumb(item, url) {
+  for (const img of [item.img, ...item.clones.map((c) => c.querySelector("img"))]) {
+    if (url) img.src = url;
+    else img.removeAttribute("src");
+  }
+}
+
+function trimThumbs() {
+  for (const item of thumbsKept) {
+    if (thumbsKept.size <= THUMB_KEEP) break;
+    if (item.inView?.size) continue;
+    thumbsKept.delete(item);
+    URL.revokeObjectURL(item.thumbUrl);
+    item.thumbUrl = null;
+    setThumb(item, null);
   }
 }
 
@@ -308,19 +363,27 @@ async function setFocus(index) {
     applyView(); // statuses may have changed while focused
     return;
   }
-  const pos = view.order.indexOf(index);
-  b.focusName.textContent = pos >= 0 ? `${item.path} (${pos + 1} of ${view.order.length})` : item.path;
-  b.prev.disabled = pos <= 0;
-  b.next.disabled = pos < 0 || pos === view.order.length - 1;
+  updateFocusNav();
   item.tile?.scrollIntoView({ block: "nearest" });
   const shown = await loadImage(item.file, { autoRun: false });
   if (batch.focus !== index) return;
   if (!shown) markUnsupported(item);
+  sim.findBtn.disabled = !!item.unsupported;
   exifPromise?.then(() => {
     if (exifData && currentFile === item.file) rememberExif(item, exifData);
   });
   await showStored(item);
   updateRunButton();
+}
+
+// The focused photo's place in the grid's order, which a new sort changes
+function updateFocusNav() {
+  const item = batch.items[batch.focus];
+  if (!item) return;
+  const pos = view.order.indexOf(batch.focus);
+  b.focusName.textContent = pos >= 0 ? `${item.path} (${pos + 1} of ${view.order.length})` : item.path;
+  b.prev.disabled = pos <= 0;
+  b.next.disabled = pos < 0 || pos === view.order.length - 1;
 }
 
 async function showStored(item) {

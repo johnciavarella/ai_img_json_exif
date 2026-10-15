@@ -29,9 +29,11 @@ import httpx
 
 from . import metadata
 from .llm import DEFAULT_USER_PROMPT, chat_payload, extract_json, stream_chat
-from .workflows import classify_vision, run_workflow, validate
+from .workflows import classify_vision, embed_vision, run_workflow, validate
 
 MAX_IMAGE_EDGE = 1536  # same as the web UI, so results match
+EMBED_MODEL = "siglip2-base"  # same as the web UI's similar photos
+EMBED_EDGE = 512  # SigLIP sees 224 px, so a small upload is enough
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".heic", ".heif", ".tif", ".tiff", ".bmp"}
 # Errors that mean a server is down or overloaded, not that the photo got a bad answer.
 # Kept in step with TRANSIENT_RE in static/batch.js.
@@ -169,13 +171,13 @@ def to_srgb(img, icc: Optional[bytes]):
     return img.convert("RGB")
 
 
-def image_data_url(path: Path) -> str:
+def image_data_url(path: Path, max_edge: int = MAX_IMAGE_EDGE) -> str:
     """Scale like the web UI: upright, sRGB, longest edge at most 1536 px, JPEG quality 90."""
     Image, ImageOps = imaging()
     with Image.open(path) as im:
         icc = im.info.get("icc_profile")
         img = to_srgb(ImageOps.exif_transpose(im), icc)
-    img.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.LANCZOS)
+    img.thumbnail((max_edge, max_edge), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=90)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
@@ -424,10 +426,10 @@ class Outputs:
 # ---------- main loop ----------
 
 async def run(args) -> int:
-    settings = load_settings(args.settings, args)
+    settings = load_settings(args.settings, args) if args.settings else None
     if (args.tag or args.zip) and not metadata.EXIFTOOL:
         sys.exit("--tag and --zip need exiftool: brew install exiftool (or apt install libimage-exiftool-perl)")
-    if settings["kind"] == "workflow" and not metadata.EXIFTOOL:
+    if settings and settings["kind"] == "workflow" and not metadata.EXIFTOOL:
         note("exiftool not found: workflow {{exif.*}} placeholders will be 'unknown'.")
     imaging()  # fail early if Pillow is missing
 
@@ -436,12 +438,122 @@ async def run(args) -> int:
         "vision_url": (args.vision_url or os.environ.get("VISION_BASE_URL") or "http://localhost:8000").rstrip("/"),
         "timeout": args.timeout,
     }
-    label = settings_label(settings)
-    run_hash = settings_hash(settings)
-    outputs = Outputs(args, settings, run_hash)
     photos = [(path, rel, photo_key(path, rel)) for path, rel in find_photos(args.paths, args.recursive)]
     if not photos:
         sys.exit("No photos found.")
+
+    code = 0
+    if args.embed:
+        code = await embed_photos(args, photos, cfg)
+        if code == EXIT_PAUSED:
+            return code
+    if args.like:
+        code = max(code, await rank_by_text(args, photos, cfg))
+        if code == EXIT_PAUSED:
+            return code
+    if settings:
+        code = max(code, await run_settings(args, settings, photos, cfg))
+    return code
+
+
+async def embed_photos(args, photos: list, cfg: dict) -> int:
+    """Write embeddings.jsonl: one unit-length vector per photo, so similar photos can be found elsewhere
+    (cosine similarity is a dot product). Photos already in the file are skipped."""
+    out = Path(args.out).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    jsonl = out / "embeddings.jsonl"
+    if args.rerun:
+        jsonl.unlink(missing_ok=True)
+    done = set()
+    if jsonl.exists():
+        for line in jsonl.read_text().splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if entry.get("model") == EMBED_MODEL:
+                done.add(entry["key"])
+    todo = [photo for photo in photos if photo[2] not in done]
+    if not todo:
+        note(f"Embeddings: all {len(photos)} photos are already in {jsonl}.")
+        return 0
+    note(f"Embeddings ({EMBED_MODEL}) · {len(todo)} photos" +
+         (f", {len(photos) - len(todo)} already done" if done else "") + f" · {jsonl}")
+
+    failed = 0
+    async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
+        with jsonl.open("a") as f:
+            for n, (path, rel, key) in enumerate(todo, 1):
+                t = time.monotonic()
+                try:
+                    data_url = image_data_url(path, EMBED_EDGE)
+                except Exception as e:  # noqa: BLE001 - unreadable or unsupported image
+                    failed += 1
+                    note(f"[{n}/{len(todo)}] {rel} ✗ Can't open image: {error_text(e)}".replace(str(path), rel))
+                    continue
+                error = None
+                for attempt in range(len(RETRY_DELAYS) + 1):
+                    try:
+                        data = await embed_vision(client, cfg["vision_url"], data_url, model=EMBED_MODEL)
+                        error = None
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        error = error_text(e)
+                        if not TRANSIENT_RE.search(error) or attempt == len(RETRY_DELAYS):
+                            break
+                        note(f"  {rel}: {error}. Retrying in {RETRY_DELAYS[attempt]}s ({attempt + 1} of {len(RETRY_DELAYS)})…")
+                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                if error and TRANSIENT_RE.search(error):
+                    note(f"Paused: the vision service is not responding ({error}). {len(todo) - n + 1} photos left. "
+                         f"Fix it, then run the same command{'' if argv_has_out() else f' with --out {args.out}'} to resume.")
+                    return EXIT_PAUSED
+                if error:
+                    failed += 1
+                    note(f"[{n}/{len(todo)}] {rel} ✗ {error}")
+                    continue
+                f.write(json.dumps({"path": rel, "key": key, "model": data["model"], "dim": data["dim"],
+                                    "vector": data["vector"]}) + "\n")
+                f.flush()
+                note(f"[{n}/{len(todo)}] {rel} ✓ {fmt_duration(time.monotonic() - t)}")
+    note(f"Embeddings: {len(todo) - failed} of {len(todo)} written to {jsonl}" + (f", {failed} failed" if failed else "") + ".")
+    return EXIT_FAILED if failed else 0
+
+
+async def rank_by_text(args, photos: list, cfg: dict) -> int:
+    """Print the photos that best match the description in --like, best first, as {"path", "score"}
+    JSON lines. The description becomes a vector in the same space as the photos'."""
+    jsonl = Path(args.out).expanduser() / "embeddings.jsonl"
+    rels = {key: rel for _, rel, key in photos}
+    vectors = {}
+    for line in jsonl.read_text().splitlines() if jsonl.exists() else []:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("model") == EMBED_MODEL and entry.get("key") in rels:
+            vectors[entry["key"]] = entry["vector"]
+    if not vectors:
+        note(f"No photos to search: none of them have embeddings in {jsonl}.")
+        return EXIT_FAILED
+    try:
+        async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
+            text = (await embed_vision(client, cfg["vision_url"], text=args.like, model=EMBED_MODEL))["vector"]
+    except Exception as e:  # noqa: BLE001
+        error = error_text(e)
+        note(f"Could not search for {args.like!r}: {error}")
+        return EXIT_PAUSED if TRANSIENT_RE.search(error) else EXIT_FAILED
+    ranked = sorted(((sum(a * b for a, b in zip(text, v)), rels[key]) for key, v in vectors.items()), reverse=True)
+    for score, rel in ranked[:args.top]:
+        print(json.dumps({"path": rel, "score": round(score, 4)}, ensure_ascii=False), flush=True)
+    note(f"Best {min(args.top, len(ranked))} of {len(ranked)} photos for {args.like!r}. "
+         "Scores rank photos within one search; they don't compare across searches.")
+    return 0
+
+
+async def run_settings(args, settings: dict, photos: list, cfg: dict) -> int:
+    label = settings_label(settings)
+    run_hash = settings_hash(settings)
+    outputs = Outputs(args, settings, run_hash)
 
     todo = []
     for path, rel, key in photos:
@@ -533,8 +645,8 @@ def parse_args(argv=None):
         epilog="Exit codes: 0 all ok, 1 some photos failed, 2 paused (a server stayed unreachable), "
                "130 interrupted. Re-running the same command resumes.",
     )
-    p.add_argument("settings", help="settings file exported from the web UI")
-    p.add_argument("paths", nargs="+", metavar="PATH", help="photos and/or folders")
+    p.add_argument("settings", metavar="SETTINGS", help="settings file exported from the web UI; optional with --embed")
+    p.add_argument("paths", nargs="*", metavar="PATH", help="photos and/or folders")
     p.add_argument("--no-recursive", dest="recursive", action="store_false", help="don't look inside subfolders")
     p.add_argument("-o", "--out", help="output folder (default ./photo-organizer-runs/<name>)")
     p.add_argument("--name", help="run name, used for the default output folder and the zip (default run-<date>-<time>)")
@@ -543,6 +655,12 @@ def parse_args(argv=None):
     p.add_argument("--tag", action="store_true", help="write tagged copies to the output folder, keeping names and subfolders")
     p.add_argument("--zip", action="store_true", help="write <name>.zip of tagged copies")
     p.add_argument("--sidecar", action="store_true", help="write <photo>.json with each photo's result")
+    p.add_argument("--embed", action="store_true",
+                   help=f"write embeddings.jsonl, a {EMBED_MODEL} vector per photo for finding similar photos")
+    p.add_argument("--like", metavar="TEXT",
+                   help="print the photos that best match a description, best first (implies --embed; "
+                        "reuse -o so photos already embedded are skipped)")
+    p.add_argument("--top", type=int, default=20, metavar="N", help="how many matches --like prints (default 20)")
     p.add_argument("--overwrite", action="store_true", help="replace metadata the photos already have (default: keep it)")
     p.add_argument("--rerun", action="store_true", help="run every photo again, ignoring earlier results in the output folder")
     p.add_argument("--api-key", help="LLM API key (default $LLM_API_KEY)")
@@ -551,6 +669,23 @@ def parse_args(argv=None):
     p.add_argument("--vision-url", help="vision service (default $VISION_BASE_URL or http://localhost:8000)")
     p.add_argument("--timeout", type=float, default=300, help="seconds per request (default 300)")
     args = p.parse_args(argv)
+    if args.like is not None:
+        if not args.like.strip():
+            p.error("--like needs a description")
+        args.embed = True  # the photos need vectors to be compared with the description
+    if args.top < 1:
+        p.error("--top must be at least 1")
+    # With --embed alone, the first argument is a photo or folder rather than a settings file
+    first = Path(args.settings).expanduser()
+    if args.embed and (first.is_dir() or first.suffix.lower() in PHOTO_EXTS):
+        args.paths.insert(0, args.settings)
+        args.settings = None
+    if not args.paths:
+        if not args.embed and (first.is_dir() or first.suffix.lower() in PHOTO_EXTS):
+            p.error(f"{args.settings} is not a settings file: give one first, or add --embed to write only embeddings")
+        p.error("give at least one photo or folder")
+    if not args.settings and (args.tag or args.zip or args.sidecar):
+        p.error("--tag, --zip and --sidecar need a settings file")
     if not args.name:
         args.name = datetime.now().strftime("run-%Y-%m-%d-%H%M")
     if not args.out:

@@ -12,6 +12,15 @@
   --box: #ff3d71;
   --bar: #2563eb;
   --tile-new: #a3a9b3;
+  /* One colour per speaker in transcripts, cycling after eight */
+  --spk-1: #2563eb;
+  --spk-2: #d97706;
+  --spk-3: #059669;
+  --spk-4: #db2777;
+  --spk-5: #7c3aed;
+  --spk-6: #0891b2;
+  --spk-7: #65a30d;
+  --spk-8: #dc2626;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
@@ -28,6 +37,14 @@
     --drop: #1f2633;
     --bar: #4f8cff;
     --tile-new: #555b64;
+    --spk-1: #60a5fa;
+    --spk-2: #fbbf24;
+    --spk-3: #34d399;
+    --spk-4: #f472b6;
+    --spk-5: #a78bfa;
+    --spk-6: #22d3ee;
+    --spk-7: #a3e635;
+    --spk-8: #f87171;
   }
 }
 
@@ -602,6 +619,8 @@ code { font-family: var(--mono); font-size: 11.5px; }
 .filter-bar select, .filter-bar > button:not(.link) { padding: 3px 6px; font-size: 12px; }
 .filter-bar label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
 .filter-bar select { max-width: 200px; }
+.filter-bar input[type="range"] { width: 180px; }
+#batchSimilarValue { width: 5em; padding: 2px 4px; font-size: 12px; font-variant-numeric: tabular-nums; }
 .search-help { line-height: 1.6; }
 .tile-group {
   grid-column: 1 / -1;
@@ -785,6 +804,7 @@ body[data-mode="batch"] .drop-zone { cursor: default; }
 .v-compare canvas { width: 100%; height: 18px; display: block; }
 .v-compare button { padding: 0 5px; font-size: 12px; line-height: 16px; }
 .v-compare .v-track.running { cursor: default; color: var(--muted); }
+.v-compare .v-track-speakers { cursor: default; }
 
 .v-panels {
   display: flex;
@@ -847,6 +867,22 @@ body[data-mode="batch"] .drop-zone { cursor: default; }
 .v-line:hover { background: var(--surface); }
 .v-line.playing { box-shadow: inset 3px 0 0 var(--accent); background: var(--drop); }
 .v-line-time { font-family: var(--mono); font-size: 11.5px; color: var(--muted); padding-top: 1px; }
+.v-line-speaker {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--spk, var(--muted));
+  border-radius: 8px;
+  color: var(--spk, var(--muted));
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 15px;
+}
+.v-subtitled { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.v-subtitled:empty { display: none; }
+.v-subtitled > div { display: flex; align-items: center; gap: 8px; }
+.v-subtitled .meta { flex: 1; }
+.v-subtitled button { padding: 0 5px; font-size: 12px; line-height: 16px; }
 .v-line mark { background: var(--drop); color: inherit; box-shadow: 0 0 0 1px var(--accent); border-radius: 2px; }
 
 .v-info { padding: 0; }
