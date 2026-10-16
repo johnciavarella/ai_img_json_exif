@@ -69,7 +69,9 @@ def run_siglip(bundle, img: Image.Image, req: "ClassifyRequest", threshold: floa
         raise HTTPException(400, "Zero-shot model needs at least one label.")
     template = req.label_template or DEFAULT_TEMPLATE
     texts = [template.format(l) if "{}" in template else f"{template} {l}" for l in labels]
-    inputs = processor(text=texts, images=img, padding="max_length", max_length=64, return_tensors="pt")
+    # The text tower only has 64 positions: cut longer labels rather than fail
+    inputs = processor(text=texts, images=img, padding="max_length", max_length=64, truncation=True,
+                       return_tensors="pt")
     with torch.inference_mode():
         logits = model(**inputs).logits_per_image[0]
     # SigLIP scores each label independently (sigmoid), so scores don't sum to 1
@@ -83,18 +85,19 @@ def embed_siglip(bundle, img: Image.Image) -> torch.Tensor:
     model, processor = bundle
     inputs = processor(images=img, return_tensors="pt")
     with torch.inference_mode():
-        vec = model.get_image_features(**inputs)[0]
+        vec = model.get_image_features(**inputs).pooler_output[0]
     # Unit length, so cosine similarity is a plain dot product
     return torch.nn.functional.normalize(vec, dim=-1)
 
 
 def embed_siglip_text(bundle, text: str) -> torch.Tensor:
     model, processor = bundle
-    # Lowercase, as SigLIP 2 was trained, and phrased like the zero-shot labels
+    # Lowercase, as SigLIP 2 was trained, and phrased like the zero-shot labels; long
+    # descriptions are cut to the 64 tokens the text tower takes
     inputs = processor(text=[DEFAULT_TEMPLATE.format(text.strip().lower())], padding="max_length",
-                       max_length=64, return_tensors="pt")
+                       max_length=64, truncation=True, return_tensors="pt")
     with torch.inference_mode():
-        vec = model.get_text_features(**inputs)[0]
+        vec = model.get_text_features(**inputs).pooler_output[0]
     return torch.nn.functional.normalize(vec, dim=-1)
 
 

@@ -1,15 +1,16 @@
-"""Who speaks when, with pyannote.audio's speaker-diarization-3.1 pipeline on the CPU.
+"""Who speaks when, with pyannote.audio's speaker-diarization-community-1 pipeline on the CPU.
 
-The pipeline finds speech in overlapping 10 s windows (segmentation-3.0), turns each window's
-voices into WeSpeaker embeddings and clusters them into speakers across the whole recording.
-It reads the same 16 kHz PCM that transcription does. The result is one list of turns per
-audio track, independent of any transcript: assign() gives each transcribed word the speaker
-whose turn it overlaps and splits lines where the speaker changes, so every transcript of that
-track shows speakers without diarizing again.
+The pipeline finds speech in overlapping 10 s windows, turns each window's voices into
+WeSpeaker embeddings and clusters them into speakers across the whole recording (VBx). It reads
+the same 16 kHz PCM that transcription does. The result is one list of turns per audio track,
+independent of any transcript, taken from the pipeline's exclusive diarization (one speaker at
+a time), which lines up with transcribed words: assign() gives each word the speaker whose turn
+it overlaps and splits lines where the speaker changes, so every transcript of that track shows
+speakers without diarizing again.
 
-The pipeline's models are gated on Hugging Face (accept the terms on the model pages) and
-download once with HF_TOKEN. Its config names the models without revisions, so each file is
-fetched at a pinned commit and the config is rewritten to point at those local files.
+The pipeline is gated on Hugging Face (accept the terms on its page) and downloads once with
+HF_TOKEN. Its repo carries the models it uses, so the files are fetched at a pinned commit and
+the pipeline loads from that snapshot without the network.
 """
 
 import gc
@@ -23,15 +24,16 @@ CACHE_DIR = Path(os.environ.get("VIDEO_CACHE", "/cache"))
 SAMPLE_RATE = 16000
 MAX_SPEAKERS = 10
 NEAREST = 1.0  # seconds: a word outside every turn takes the nearest turn this close
-LABEL = "pyannote speaker-diarization-3.1"
+MODEL = "speaker-diarization-community-1"
+LABEL = f"pyannote {MODEL}"
 
-# (repo, revision, file): pinned, so a changed upload can't change results
-PIPELINE = ("pyannote/speaker-diarization-3.1", "84fd25912480287da0247647c3d2b4853cb3ee5d", "config.yaml")
-SEGMENTATION = ("pyannote/segmentation-3.0", "e66f3d3b9eb0873085418a7b813d3b369bf160bb", "pytorch_model.bin")
-EMBEDDING = ("pyannote/wespeaker-voxceleb-resnet34-LM", "837717ddb9ff5507820346191109dc79c958d614", "pytorch_model.bin")
-FILES = (PIPELINE, SEGMENTATION, EMBEDDING)
+# Pinned, so a changed upload can't change results
+REPO = f"pyannote/{MODEL}"
+REVISION = "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee"
+FILES = ("config.yaml", "segmentation/pytorch_model.bin", "embedding/pytorch_model.bin",
+         "plda/plda.npz", "plda/xvec_transform.npz")
 SIZE_MB = 33
-GATED = ("pyannote/speaker-diarization-3.1", "pyannote/segmentation-3.0")
+GATED = (REPO,)
 
 # Share of the progress bar per step; the embeddings take most of the time
 STEPS = {"segmentation": (0.0, 0.2), "embeddings": (0.2, 0.97)}
@@ -41,13 +43,13 @@ def model_dir() -> Path:
     return CACHE_DIR / "pyannote"
 
 
-def cached(repo: str, revision: str, filename: str) -> Path:
-    # The hub cache's layout: models--<org>--<name>/snapshots/<revision>/<file>
-    return model_dir() / f"models--{repo.replace('/', '--')}" / "snapshots" / revision / filename
+def snapshot() -> Path:
+    # The hub cache's layout: models--<org>--<name>/snapshots/<revision>/
+    return model_dir() / f"models--{REPO.replace('/', '--')}" / "snapshots" / REVISION
 
 
 def downloaded() -> bool:
-    return all(cached(*f).exists() for f in FILES)
+    return all((snapshot() / f).exists() for f in FILES)
 
 
 def token() -> str:
@@ -87,21 +89,14 @@ def key(params: dict) -> str:
 # ---------- diarization ----------
 
 def fetch() -> Path:
-    """The pinned files on disk and a config pointing at them; downloads what's missing."""
+    """The pinned pipeline folder on disk; downloads what's missing. Its config refers to the
+    models as $model/<subfolder>, which pyannote resolves inside this folder."""
     if not downloaded():
         from huggingface_hub import hf_hub_download
 
-        for repo, revision, filename in FILES:
-            hf_hub_download(repo, filename, revision=revision, cache_dir=str(model_dir()), token=token() or None)
-    import yaml
-
-    config = yaml.safe_load(cached(*PIPELINE).read_text())
-    params = config["pipeline"]["params"]
-    params["segmentation"] = str(cached(*SEGMENTATION))
-    params["embedding"] = str(cached(*EMBEDDING))  # contains "pyannote", which picks pyannote's loader
-    local = model_dir() / f"speaker-diarization-3.1-{PIPELINE[1][:12]}.yaml"
-    local.write_text(yaml.safe_dump(config))
-    return local
+        for filename in FILES:
+            hf_hub_download(REPO, filename, revision=REVISION, cache_dir=str(model_dir()), token=token() or None)
+    return snapshot()
 
 
 def diarize(pcm_path: Path, params: dict, report: Callable[[float], None],
@@ -132,6 +127,8 @@ def diarize(pcm_path: Path, params: dict, report: Callable[[float], None],
         found = pipeline({"waveform": waveform, "sample_rate": SAMPLE_RATE}, hook=hook,
                          **({"num_speakers": params["speakers"]} if params["speakers"] else {}))
         del waveform
+        # One speaker at a time, so each transcribed word falls in a single speaker's turn
+        found = found.exclusive_speaker_diarization
         # Speakers numbered from 1 in the order they first speak
         numbers = {}
         turns = []

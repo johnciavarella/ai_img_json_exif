@@ -7,6 +7,12 @@ vision service directly, using the same code as the server. Progress goes to std
 processed photo is also printed to stdout as one JSON line. See the README's CLI section.
 """
 
+import sys
+
+if sys.version_info < (3, 10):
+    # Checked before the other imports, so an old Python gets this instead of a syntax error
+    sys.exit("The CLI needs Python 3.10 or newer (macOS's built-in python3 is 3.9: brew install python)")
+
 import argparse
 import asyncio
 import base64
@@ -17,7 +23,6 @@ import logging
 import os
 import re
 import shutil
-import sys
 import time
 import zipfile
 from datetime import datetime, timezone

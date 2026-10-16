@@ -2,5 +2,13 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "Python 3.15 has no wheels yet for pyyaml (all images), sentencepiece (vision), or torchcodec, ctranslate2 and onnxruntime (video)",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["python"],
+      "allowedVersions": "<3.15"
+    }
   ]
 }

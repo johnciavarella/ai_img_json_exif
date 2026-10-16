@@ -4,6 +4,8 @@ The CLI tool (`python -m app.cli`) allows running classification workflows, gene
 
 ## Installation
 
+The CLI needs Python 3.10 or newer. On macOS the built-in `python3` is 3.9, so install a current one first (`brew install python`) and make sure `python3 --version` shows it.
+
 Create a dedicated virtual environment and install the CLI requirements:
 
 ```sh

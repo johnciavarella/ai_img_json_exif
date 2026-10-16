@@ -38,15 +38,17 @@ Transcription is powered by [faster-whisper](https://github.com/SYSTRAN/faster-w
 
 ## Speaker Diarization (pyannote)
 
-**Identify speakers** finds who speaks when, using [pyannote.audio](https://github.com/pyannote/pyannote-audio) `speaker-diarization-3.1` on the CPU.
+**Identify speakers** finds who speaks when, using [pyannote.audio](https://github.com/pyannote/pyannote-audio) `speaker-diarization-community-1` on the CPU.
 
-- **Setup (once):** the models are gated on Hugging Face. Accept the terms of [`pyannote/speaker-diarization-3.1`](https://hf.co/pyannote/speaker-diarization-3.1) and [`pyannote/segmentation-3.0`](https://hf.co/pyannote/segmentation-3.0), create a read token at <https://hf.co/settings/tokens>, put `HF_TOKEN=hf_...` in `.env`, and restart the video service (`podman compose up -d video`). The 33 MB of models download into `video-cache` on first use, pinned to fixed revisions; after that the token is no longer needed. Until it is set, the button is disabled and its tooltip says why.
+- **Setup (once):** the pipeline is gated on Hugging Face. Accept the terms of [`pyannote/speaker-diarization-community-1`](https://hf.co/pyannote/speaker-diarization-community-1), create a read token at <https://hf.co/settings/tokens>, put `HF_TOKEN=hf_...` in `.env`, and restart the video service (`podman compose up -d video`). The 33 MB pipeline downloads into `video-cache` on first use, pinned to a fixed revision; after that the token is no longer needed. Installs that used the earlier `speaker-diarization-3.1` need the new terms accepted and the token set once more. Until it is set, the button is disabled and its tooltip says why.
 - **One result per audio track,** independent of any transcript: every Whisper transcript of that track shows the speakers, so you can re-transcribe with another model without identifying speakers again.
+- **Turns:** one speaker at a time (the pipeline's exclusive diarization), so each word belongs to a single speaker. Results made with 3.1 stay until you identify speakers again.
 - **Speaker count:** *Auto* detects it; choosing 1-10 fixes it, which usually helps when you know it. Running again with a different number replaces the result.
 - **In the UI:** lines are split where the speaker changes, and a coloured **S1**, **S2**... label marks each change. A **Speakers** row under the timeline shows each speaker's stretches in their own colour (× deletes it), and the timeline's hover names the speaker. Speakers are numbered by who speaks first and cannot be renamed.
 - **Exports:** SRT prefixes `Speaker N:` where the speaker changes, VTT uses voice tags (`<v Speaker N>`), TXT puts it on each line, and JSON adds `speaker` to each segment and a top-level `speakers` count. Scene `speech` text stays plain.
 - **Memory:** the whole audio track is loaded as float32 (about 1 GB for 4 hours).
-- **Licences:** pyannote.audio and the segmentation and pipeline models are MIT; the speaker-embedding weights (WeSpeaker ResNet34, VoxCeleb) are CC-BY-4.0.
+- **Licences:** pyannote.audio is MIT; the `speaker-diarization-community-1` pipeline and its models (segmentation, WeSpeaker ResNet34 embeddings, PLDA) are CC-BY-4.0.
+- **Telemetry:** pyannote.audio 4 sends usage metrics by default; the video image turns this off (`PYANNOTE_METRICS_ENABLED=false`).
 
 ---
 
