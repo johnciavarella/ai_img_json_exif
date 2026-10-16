@@ -1,24 +1,28 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
-# Same base, env and torch layer as vision/Containerfile, so the build cache shares that layer
+# Same base and env as vision/Containerfile. pyannote.audio 4 telemetry is on by default and
+# would send usage metrics to pyannote's servers: keep it off.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/cache/hf \
-    TORCH_HOME=/cache/torch
+    TORCH_HOME=/cache/torch \
+    PYANNOTE_METRICS_ENABLED=false
 
 WORKDIR /srv
 
-# torch in its own layer so changing requirements.txt doesn't re-download it
+# torch in its own layer so changing requirements.txt doesn't re-download it. 2.11 rather than
+# vision's version: torchaudio, which pyannote.audio needs, stopped at 2.11 and must match torch
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
-        torch==2.5.1 torchvision==0.20.1
+        torch==2.11.0 torchvision==0.26.0
 
-# torchaudio for pyannote's speaker diarization: in a layer of its own so the one above stays
-# shared with vision/, and from the CPU index so pip can't pull a CUDA build
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torchaudio==2.5.1
+# torchaudio and torchcodec for pyannote's speaker diarization, from the CPU index so pip can't
+# pull a CUDA build
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+        torchaudio==2.11.0 torchcodec==0.17.0
 
 # ffmpeg builds the proxy, feeds the detectors, extracts audio for transcription and burns in
 # subtitles, with libass drawing them in DejaVu and, for Chinese, Japanese and Korean, Noto CJK.
-# torchaudio needs libgomp.
+# torchaudio needs libgomp; torchcodec uses ffmpeg's libraries.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-cjk libgomp1 \
  && rm -rf /var/lib/apt/lists/*

@@ -1,9 +1,9 @@
 # torch is installed first from the CPU wheel index (see Containerfile)
-fastapi==0.143.0
+fastapi==0.143.2
 uvicorn[standard]==0.54.0
-numpy==2.5.3
-scenedetect==0.7.1
+numpy==2.5.4
+scenedetect==0.7.2
 opencv-python-headless==5.0.0.93
 faster-whisper==1.2.1
-# 3.x runs on torch 2.5.1 (4.x needs 2.8); constraints.txt keeps its dependencies from upgrading torch
-pyannote.audio==3.4.0
+# 4.x needs torch 2.8+; constraints.txt keeps its dependencies on the Containerfile's CPU builds
+pyannote.audio==4.0.7

@@ -197,7 +197,7 @@ VISION_BASE_URL=http://127.0.0.1:8000
 # LLM_API_KEY=your-api-key
 ```
 
-**Commands:**
+**Commands** (Python 3.10 or newer; on macOS, `brew install python`, since the built-in `python3` is 3.9):
 ```sh
 python3 -m venv .venv-cli && .venv-cli/bin/pip install -r requirements-cli.txt
 docker compose up -d vision  # auxiliary vision service on port 8000
@@ -289,7 +289,7 @@ CPU-optimized speech transcription in the `video` service via `faster-whisper`:
 | `large-v3` | 3.1 GB | Maximum transcription fidelity |
 
 ### Speaker Diarization Models
-Speaker identification in the `video` service via [pyannote.audio](https://github.com/pyannote/pyannote-audio) `speaker-diarization-3.1` (33 MB, CPU). The models are gated on Hugging Face: accept the terms of [`pyannote/speaker-diarization-3.1`](https://hf.co/pyannote/speaker-diarization-3.1) and [`pyannote/segmentation-3.0`](https://hf.co/pyannote/segmentation-3.0), then set `HF_TOKEN` in `.env`. The token is only needed for the first download.
+Speaker identification in the `video` service via [pyannote.audio](https://github.com/pyannote/pyannote-audio) `speaker-diarization-community-1` (33 MB, CPU). The pipeline is gated on Hugging Face: accept the terms of [`pyannote/speaker-diarization-community-1`](https://hf.co/pyannote/speaker-diarization-community-1), then set `HF_TOKEN` in `.env`. The token is only needed for the first download.
 
 ---
 
@@ -312,4 +312,4 @@ Detailed guides are available in the [`docs/`](docs/) directory:
 
 [MIT](LICENSE)
 
-Model licences: the speaker-embedding weights used by pyannote (`wespeaker-voxceleb-resnet34-LM`) are [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/), so attribution is required if you redistribute them; pyannote.audio, `segmentation-3.0`, and the 3.1 pipeline are MIT. Whisper and faster-whisper are MIT.
+Model licences: pyannote's `speaker-diarization-community-1` pipeline and its models are [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/), so attribution is required if you redistribute them; pyannote.audio is MIT. Whisper and faster-whisper are MIT.

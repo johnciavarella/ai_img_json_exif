@@ -529,7 +529,7 @@ def run_diarize(params: dict):
         path = speakers_path(root, params["track"])
         path.parent.mkdir(exist_ok=True)
         write_json(path, {
-            "engine": "pyannote.audio", "model": "speaker-diarization-3.1", "label": diarize.LABEL,
+            "engine": "pyannote.audio", "model": diarize.MODEL, "label": diarize.LABEL,
             "params": params, "created": time.time(), "elapsed": round(time.time() - started, 1),
             "duration": info["duration"], "count": out["count"], "turns": out["turns"],
         })
@@ -1143,7 +1143,8 @@ def start_diarize(video_id: str, req: DiarizeRequest):
     params = diarize.normalize(req.model_dump(), len((info or {}).get("audio") or [None]))
     key = diarize.key(params)
     done = read_json(speakers_path(root, params["track"]))
-    if done and done.get("params") == params:
+    # A result from another model (3.1, before community-1) runs again
+    if done and done.get("params") == params and done.get("model") == diarize.MODEL:
         return {"key": key, "cached": True}
     if not source_path(root):
         raise HTTPException(409, "The upload is not complete.")

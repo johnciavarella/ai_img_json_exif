@@ -47,11 +47,12 @@ To enable TransNetV2, PySceneDetect, Whisper transcription, and speaker identifi
 python3 -m venv .venv-video
 source .venv-video/bin/activate
 # torch first, so pyannote.audio's dependencies don't replace it (constraints.txt pins the versions)
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 torchcodec==0.17.0
 pip install -r video/requirements.txt -c video/constraints.txt
 
 cd video
-HF_TOKEN=hf_... VIDEO_DIR=../data/videos VIDEO_CACHE=../data/cache uvicorn server:app --port 8001
+# PYANNOTE_METRICS_ENABLED=false keeps pyannote.audio from sending usage metrics (it's on by default)
+HF_TOKEN=hf_... PYANNOTE_METRICS_ENABLED=false VIDEO_DIR=../data/videos VIDEO_CACHE=../data/cache uvicorn server:app --port 8001
 ```
 Then configure the web app with `VIDEO_BASE_URL=http://localhost:8001`.
 
